@@ -530,7 +530,7 @@ Detection is cheap: no description parsing and no regex over the full body unles
   - Salary: JSON-LD shapes, LPA conversion, the "Not disclosed" filter, the keyword-distance rule.
   - `canonicalUrl`: LinkedIn view/slug/`currentJobId`, Indeed `jk`/`vjk`, tracking-parameter removal, `gh_jid` kept, `/apply` and trailing slash removed.
   - `sourceFromHost`: every mapped host plus the Company Site fallback.
-- **Fixture tests (`extract.test.js`):** a table of `{ fixture, url, expected }` covering LinkedIn (including a search page with `currentJobId` and stale JSON-LD), Naukri, Indeed, Glassdoor, Greenhouse, Lever, Workday, Ashby, a **JSON-LD-only** page (malformed and `@graph` variants) and a **plain career page** that relies on heuristics only. Each test checks every field and `isJobPage`.
+- **Fixture tests (`extract.test.js`):** a table of `{ fixture, url, expected }` covering LinkedIn (including a search page with `currentJobId` and stale JSON-LD), Naukri, Indeed, Glassdoor, Greenhouse, Lever, Workday, Ashby, a **JSON-LD-only** page (malformed JSON inside `@graph`) and a **plain career page** that relies on heuristics only. Each test checks every field and `isLikelyJobPage`. A blog post fixture and LinkedIn's feed URL check that detection stays quiet on non-job pages.
 - **Apps Script tests (`apps-script.test.js`):** `Code.gs` is read as text and run with `node:vm` in a context that provides small in-memory mocks of `SpreadsheetApp` (a sheet backed by a 2D array, with `getRange`/`getValues`/`setValues`/`getLastRow`/`insertRowsAfter`; formatting calls are absorbed by a chainable proxy), `LockService`, `ContentService`, `ScriptApp` and `Utilities`. `Code.gs` contains no Node-specific code. The tests cover:
   - Each `doGet`/`doPost` action and error code
   - The token check, both enabled and disabled
@@ -540,7 +540,9 @@ Detection is cheap: no description parsing and no regex over the full body unles
   - Row top-up when the pre-formatted rows run out
   - Duplicate lookup by normalized link
   - `setup()` idempotency: running it twice gives the same validation, rules and trigger count
-- **Manual QA checklist** (to be added to the README in M7):
+- **Sync test:** status colors and tracking parameters are duplicated across `Code.gs` (which can't import anything), `ui.js` and `extract.js`. A test compares the literal blocks so they can't drift apart.
+- **UI and options page:** checked by hand (see the checklist below). They are thin wiring over the tested modules.
+- **Manual QA checklist:**
   - Load unpacked in Chrome, Edge and Brave.
   - Save from each supported site.
   - Navigate between jobs in the LinkedIn search list without reloading.
@@ -555,15 +557,25 @@ Detection is cheap: no description parsing and no regex over the full body unles
 
 ## 10. Milestone roadmap
 
-Each milestone lands as one or more small, single-line conventional commits. Tests are added in the same milestone as the code they cover.
+### Built (v1.0)
 
-| # | Milestone | Scope | Example commits |
-|---|---|---|---|
-| M0 | Plan and repo | This document, README placeholder, LICENSE, .gitignore | `chore: initialize repository with license and gitignore`, `docs: add architecture plan` |
-| M1 | Field parsers | `extract.js` UMD skeleton, `parseYoe`, `detectWorkMode`, `parseSalary`, `canonicalUrl`, `sourceFromHost`. `package.json` and `fields.test.js` | `chore: add node test setup`, `feat: add yoe parser`, `feat: add url canonicalization` |
-| M2 | JSON-LD and heuristics | Robust JSON-LD reader, stale guard, generic role/company/location/description, job-page detection, JSON-LD-only and plain-career fixtures | `feat: add json-ld job posting reader`, `feat: add generic page heuristics` |
-| M3 | Site readers | `sites.js` readers for the eight platforms, with one fixture and a test row each | `feat: add linkedin reader`, `feat: add workday reader` |
-| M4 | Apps Script backend | `Code.gs` API, setup, Summary, triggers, menu, `appsscript.json`, vm-mocked tests | `feat: add apps script web app`, `feat: add sheet setup and summary`, `test: cover apps script with mocked services` |
-| M5 | Extension shell | `manifest.json`, `background.js` (fetch and error mapping, action/command, injection fallback, onInstalled), options page | `feat: add manifest and service worker`, `feat: add options page` |
-| M6 | In-page UI | `content.js`: floating tab with ×, Shadow DOM panel, validation, duplicate warning, save/success/error states, key isolation, SPA watcher, button modes | `feat: add floating button and panel`, `feat: add duplicate warning` |
-| M7 | Polish and docs | Dark mode pass, error copy, icons, README setup guide (sheet, deploy, load unpacked), QA checklist | `feat: add extension icons`, `docs: add setup guide to readme` |
+Each step landed as its own single-line conventional commit, in this order:
+
+| # | Step | Scope |
+|---|---|---|
+| 0 | Plan and repo | This document, LICENSE, .gitignore |
+| 1 | Apps Script backend | `Code.gs` (Web App API, setup, Summary, triggers, menu) and `appsscript.json` |
+| 2 | Extension shell | `manifest.json` and `background.js` (Web App client, error mapping, toolbar/shortcut, injection fallback, first-run options) |
+| 3 | Extractor | `extract.js`: site readers, JSON-LD, heuristics, field rules, detection |
+| 4 | In-page UI | `ui.js`: floating tab, Shadow DOM panel, duplicate warning, save flow, key isolation, SPA watcher, button modes |
+| 5 | Options page | URL and secret, connection test, button mode, hidden sites, shortcut |
+| 6 | Icons | `scripts/make-icons.js` and the generated PNGs |
+| 7 | Tests | `package.json`, fixtures, `fields`/`extract`/`apps-script` suites |
+| 8 | README | User-facing guide |
+
+### Next
+
+- More site readers (SmartRecruiters, Workable, Wellfound, Instahyre) with fixtures, promoted from source-name mapping only.
+- A status-history tab so interview rate counts jobs that later moved to Rejected.
+- Optional "Saved" quick action from the toolbar without opening the panel.
+- Firefox build (MV3 `background.scripts` fallback) once the Chrome version is stable.

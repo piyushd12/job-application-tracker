@@ -1,0 +1,17 @@
+{
+  "name": "job-application-tracking-extension",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Chrome extension that saves the job you just applied to into your own Google Sheet with one click.",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test",
+    "icons": "node scripts/make-icons.js"
+  },
+  "devDependencies": {
+    "jsdom": "^26.1.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
