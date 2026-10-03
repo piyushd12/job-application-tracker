@@ -24,6 +24,9 @@ test('YOE: ranges, plus forms, minimums and plain forms', () => {
 
 test('YOE: number words', () => {
   assert.equal(extractYOE('Three (3) years of relevant experience'), '3 yrs');
+  assert.equal(extractYOE('Three to five years of experience'), '3-5 yrs');
+  assert.equal(extractYOE('ten+ years of experience leading teams'), '10+ yrs');
+  assert.equal(extractYOE('at least two years of experience'), '2+ yrs');
   assert.equal(extractYOE('five years of experience in finance'), '5 yrs');
   assert.equal(extractYOE('two to four years of experience'), '2-4 yrs');
 });
@@ -33,11 +36,15 @@ test('YOE: requires "experience" within ~90 characters', () => {
   const far = `5 years ${'x'.repeat(120)} experience`;
   assert.equal(extractYOE(far), 'N/A');
   assert.equal(extractYOE('2-5 years', { requireContext: false }), '2-5 yrs');
+  assert.equal(extractYOE('3-5 Yrs', { requireContext: false }), '3-5 yrs', 'Naukri header chip');
+  assert.equal(extractYOE('0-2 Yrs', { requireContext: false }), '0-2 yrs');
 });
 
 test('YOE: rejects values over 30, ages and "ago"', () => {
   assert.equal(extractYOE('Must be 18 years old. No prior experience needed.'), 'N/A');
   assert.equal(extractYOE('Founded 25 years ago, we value experience.'), 'N/A');
+  assert.equal(extractYOE('Founded 10 years ago, we now need 2 years of experience in Go.'), '2 yrs');
+  assert.equal(extractYOE('Founded ten years ago. Experience with Kubernetes is a plus.'), 'N/A');
   assert.equal(extractYOE('40 years of combined team experience'), 'N/A');
   assert.equal(extractYOE('5-3 years experience'), 'N/A');
 });
@@ -58,6 +65,8 @@ test('work mode: explicit beats loose beats strict, Hybrid > Remote > On-site', 
   assert.equal(workModeFrom({ explicit: 'On-site', description: 'fully remote' }), 'On-site');
   assert.equal(workModeFrom({ location: 'Remote, Hybrid' }), 'Hybrid');
   assert.equal(workModeFrom({ location: 'Bengaluru (Remote)' }), 'Remote');
+  assert.equal(workModeFrom({ location: 'Remote (India)' }), 'Remote');
+  assert.equal(workModeFrom({ location: 'Pune; Mumbai', description: 'Hybrid: 3 days a week in the office.' }), 'Hybrid');
   assert.equal(workModeFrom('Onsite - Mumbai'), 'On-site');
   assert.equal(workModeFrom({ location: 'Pune', description: 'This is a fully remote position.' }), 'Remote');
   assert.equal(workModeFrom({ description: 'Work from office 5 days a week.' }), 'On-site');
@@ -65,6 +74,7 @@ test('work mode: explicit beats loose beats strict, Hybrid > Remote > On-site', 
 
 test('work mode: strict description phrases only', () => {
   assert.equal(workModeFrom({ description: 'You will collaborate with remote teams across time zones.' }), 'N/A');
+  assert.equal(workModeFrom({ description: 'Experience managing remote teams is a plus.', location: 'Chennai' }), 'N/A');
   assert.equal(workModeFrom({ description: 'Experience with hybrid cloud deployments.' }), 'N/A');
   assert.equal(workModeFrom({ description: 'We follow a hybrid work model.' }), 'Hybrid');
   assert.equal(workModeFrom({}), 'N/A');
@@ -82,6 +92,7 @@ test('salary: ignores amounts far from salary keywords', () => {
   assert.equal(salaryFromText('We raised $5 million in our Series A last year.'), '');
   assert.equal(salaryFromText('Manage a $2M marketing budget.'), '');
   assert.equal(salaryFromText(''), '');
+  assert.equal(salaryFromText('Salary: Not disclosed'), '');
 });
 
 test('canonical URL: LinkedIn', () => {
@@ -109,6 +120,27 @@ test('canonical URL: strips tracking, hash, /apply and trailing slash', () => {
   assert.equal(canonicalUrl('https://acme.com/jobs/42?b=2&a=1'), 'https://acme.com/jobs/42?a=1&b=2');
   assert.equal(canonicalUrl('https://acme.com:443/'), 'https://acme.com');
   assert.equal(canonicalUrl('not a url'), 'not a url');
+  assert.equal(canonicalUrl('https://www.acmerobotics.com/careers/?gh_jid=4567890&gh_src=x'), 'https://www.acmerobotics.com/careers?gh_jid=4567890');
+});
+
+test('canonical URL: path-identified job sites drop search and session parameters', () => {
+  assert.equal(
+    canonicalUrl('https://acme.wd5.myworkdayjobs.com/en-US/External/job/Pune/QA_R-1?source=LinkedIn'),
+    'https://acme.wd5.myworkdayjobs.com/External/job/Pune/QA_R-1',
+  );
+  assert.equal(
+    canonicalUrl('https://wd3.myworkdaysite.com/fr-FR/recruiting/acme/External/job/Paris/Dev_R-2'),
+    'https://wd3.myworkdaysite.com/recruiting/acme/External/job/Paris/Dev_R-2',
+  );
+  assert.equal(
+    canonicalUrl('https://www.naukri.com/job-listings-dev-acme-pune-2-to-5-years-031025500123?src=jobsearchDesk&sid=99&xp=1'),
+    'https://www.naukri.com/job-listings-dev-acme-pune-2-to-5-years-031025500123',
+  );
+  assert.equal(canonicalUrl('https://job-boards.greenhouse.io/acme/jobs/123?gh_src=x&t=y'), 'https://job-boards.greenhouse.io/acme/jobs/123');
+  assert.equal(
+    canonicalUrl('https://job-boards.greenhouse.io/embed/job_app?for=acme&token=123'),
+    'https://job-boards.greenhouse.io/embed/job_app?for=acme&token=123',
+  );
 });
 
 test('source from hostname', () => {

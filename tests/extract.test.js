@@ -8,9 +8,9 @@ const { JSDOM } = require('jsdom');
 const { extractJob, isLikelyJobPage, readJsonLdPostings } = require('../extension/content/extract.js');
 
 function load(fixture, url) {
-  const html = fs.readFileSync(path.join(__dirname, 'fixtures', fixture), 'utf8');
-  return new JSDOM(html, { url }).window.document;
+  return load.fromHtml(fs.readFileSync(path.join(__dirname, 'fixtures', fixture), 'utf8'), url);
 }
+load.fromHtml = (html, url) => new JSDOM(html, { url }).window.document;
 
 const CASES = [
   {
@@ -36,7 +36,7 @@ const CASES = [
     expected: {
       company: 'Acme Technologies', role: 'Backend Developer', workMode: 'Hybrid', location: 'Pune',
       yoe: '2-5 yrs', salary: '10-14 LPA', source: 'Naukri',
-      url: 'https://www.naukri.com/job-listings-backend-developer-acme-technologies-pune-2-to-5-years-031025500123?sid=1&src=jobsearchDesk',
+      url: 'https://www.naukri.com/job-listings-backend-developer-acme-technologies-pune-2-to-5-years-031025500123',
     },
   },
   {
@@ -78,7 +78,7 @@ const CASES = [
     expected: {
       company: 'Acme', role: 'Senior QA Engineer', workMode: 'Hybrid', location: 'Pune, India',
       yoe: '4+ yrs', salary: '', source: 'Workday',
-      url: 'https://acme.wd5.myworkdayjobs.com/en-US/External/job/Pune-India/Senior-QA-Engineer_R-12345?source=LinkedIn',
+      url: 'https://acme.wd5.myworkdayjobs.com/External/job/Pune-India/Senior-QA-Engineer_R-12345',
     },
   },
   {
@@ -107,6 +107,65 @@ const CASES = [
       url: 'https://careers.initech.com/openings/backend-engineer',
     },
   },
+  // ----- Edge cases -----
+  {
+    // "3-5 Yrs" chip, salary "Not disclosed", several location links, "remote teams" and "Founded 10 years ago" in the text.
+    fixture: 'naukri-edge.html',
+    url: 'https://www.naukri.com/job-listings-data-engineer-acme-technologies-pune-mumbai-bengaluru-3-to-5-years-031025500999?src=jobsearchDesk&sid=17000',
+    expected: {
+      company: 'Acme Technologies', role: 'Data Engineer', workMode: 'N/A', location: 'Pune; Mumbai; Bengaluru',
+      yoe: '3-5 yrs', salary: '', source: 'Naukri',
+      url: 'https://www.naukri.com/job-listings-data-engineer-acme-technologies-pune-mumbai-bengaluru-3-to-5-years-031025500999',
+    },
+  },
+  {
+    // "Remote (India)" location, years written as words after a "Founded 10 years ago" distractor.
+    fixture: 'lever-remote.html',
+    url: 'https://jobs.lever.co/acme/2c3d4e5f-6071-8293-a4b5-c6d7e8f90a1b?lever-origin=applied',
+    expected: {
+      company: 'Acme', role: 'Support Engineer', workMode: 'Remote', location: 'Remote (India)',
+      yoe: '3-5 yrs', salary: '', source: 'Lever', url: 'https://jobs.lever.co/acme/2c3d4e5f-6071-8293-a4b5-c6d7e8f90a1b',
+    },
+  },
+  {
+    // Greenhouse embedded on a company domain: the job is in a cross-origin iframe, gh_jid identifies it.
+    fixture: 'greenhouse-embed.html',
+    url: 'https://www.acmerobotics.com/careers/?gh_jid=4567890&gh_src=abc123',
+    expected: {
+      company: 'Acme Robotics', role: '', workMode: 'N/A', location: '',
+      yoe: 'N/A', salary: '', source: 'Company Site', url: 'https://www.acmerobotics.com/careers?gh_jid=4567890',
+    },
+  },
+  {
+    // No h1: role and company come from the title; Hybrid is only mentioned in the description.
+    fixture: 'no-h1.html',
+    url: 'https://jobs.example-corp.com/positions/12345',
+    expected: {
+      company: 'Example Corp', role: 'Senior Product Designer', workMode: 'Hybrid', location: 'Austin, TX',
+      yoe: '5+ yrs', salary: '', source: 'Company Site', url: 'https://jobs.example-corp.com/positions/12345',
+    },
+  },
+  {
+    // Workday locale path (/de-DE/), several locations, no remoteType field.
+    fixture: 'workday-multi.html',
+    url: 'https://acme.wd5.myworkdayjobs.com/de-DE/External/job/Multiple-Locations/Data-Analyst_R-555?source=Indeed',
+    expected: {
+      company: 'Acme', role: 'Data Analyst', workMode: 'Remote', location: 'Pune, India; Bengaluru, India',
+      yoe: '2-4 yrs', salary: '', source: 'Workday',
+      url: 'https://acme.wd5.myworkdayjobs.com/External/job/Multiple-Locations/Data-Analyst_R-555',
+    },
+  },
+  {
+    // JSON-LD inside an HTML comment, with a raw newline in a string, trailing commas and two locations,
+    // next to a block that is broken beyond repair.
+    fixture: 'jsonld-malformed.html',
+    url: 'https://stark.example/careers/qa-lead',
+    expected: {
+      company: 'Stark Industries', role: 'QA Lead', workMode: 'N/A',
+      location: 'Pune, Maharashtra, IN; Hyderabad, Telangana, IN',
+      yoe: '6+ yrs', salary: '12-18 LPA', source: 'Company Site', url: 'https://stark.example/careers/qa-lead',
+    },
+  },
 ];
 
 for (const { fixture, url, expected } of CASES) {
@@ -125,6 +184,33 @@ for (const { fixture, url, expected } of CASES) {
 test('detection ignores non-job pages', () => {
   assert.equal(isLikelyJobPage(load('not-a-job.html', 'https://acme.dev/blog/scaling-postgres'), 'https://acme.dev/blog/scaling-postgres'), false);
   assert.equal(isLikelyJobPage(load('linkedin.html', 'https://www.linkedin.com/feed/'), 'https://www.linkedin.com/feed/'), false);
+  assert.equal(isLikelyJobPage(load('linkedin.html', 'https://www.linkedin.com/jobs/'), 'https://www.linkedin.com/jobs/'), false);
+});
+
+test('detection covers LinkedIn search and collection pages with currentJobId', () => {
+  for (const url of [
+    'https://www.linkedin.com/jobs/search/?currentJobId=4099999999&keywords=data',
+    'https://www.linkedin.com/jobs/collections/recommended/?currentJobId=4099999999',
+  ]) {
+    const doc = load('linkedin-stale-jsonld.html', url);
+    assert.equal(isLikelyJobPage(doc, url), true, url);
+    assert.equal(extractJob(doc, url).url, 'https://www.linkedin.com/jobs/view/4099999999');
+  }
+});
+
+test('very long descriptions are capped and stay fast', () => {
+  const filler = '<p>Our platform team ships every day and values ownership. </p>'.repeat(20000); // ~1.2 MB
+  const html = (intro) => `<!doctype html><html><head><title>Backend Engineer | Acme</title></head><body>
+    <h1>Backend Engineer</h1><div class="job-description"><p>${intro}</p>${filler}<p>Salary: 30-40 LPA</p></div></body></html>`;
+  const url = 'https://careers.acme.com/jobs/1';
+
+  const started = Date.now();
+  const doc = load.fromHtml(html('Requirements: 4+ years of experience.'), url);
+  assert.equal(isLikelyJobPage(doc, url), true);
+  const job = extractJob(doc, url);
+  assert.ok(Date.now() - started < 3000, `took ${Date.now() - started} ms`);
+  assert.equal(job.yoe, '4+ yrs');
+  assert.equal(job.salary, '', 'text past the 50,000-character cap is not parsed');
 });
 
 test('extraction still returns a usable job on an unrelated page', () => {
@@ -142,7 +228,10 @@ test('JSON-LD reader handles arrays, @graph, mainEntity and broken JSON', () => 
     <script type="application/ld+json">{"@type":"WebPage","mainEntity":{"@type":"JobPosting","title":"B"}}</script>
     <script type="application/ld+json">{"@graph":[{"@type":"http://schema.org/JobPosting","title":"C"}]}</script>
     <script type="application/ld+json">{ this is not json</script>
+    <script type="application/ld+json">//<![CDATA[
+      {"@type":"JobPosting","title":"D",}
+    //]]></script>
   </head><body></body></html>`;
   const doc = new JSDOM(html).window.document;
-  assert.deepEqual(readJsonLdPostings(doc).map((p) => p.title), ['A', 'B', 'C']);
+  assert.deepEqual(readJsonLdPostings(doc).map((p) => p.title), ['A', 'B', 'C', 'D']);
 });

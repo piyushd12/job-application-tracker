@@ -64,6 +64,18 @@
     return selectors.flatMap((s) => queryAll(doc, s)).map(textOf).filter(Boolean).join(' · ');
   }
 
+  /** Like pick, but several links or list items inside the match (multiple locations) become "A; B". */
+  function pickPlaces(doc, ...selectors) {
+    for (const selector of selectors) {
+      const el = query(doc, selector);
+      if (!el) continue;
+      const items = [...new Set(queryAll(el, 'a, li, dd').map(textOf).filter(Boolean))];
+      const text = items.length > 1 ? items.join('; ') : textOf(el);
+      if (text) return text;
+    }
+    return '';
+  }
+
   function pickAttr(doc, selector, attribute) {
     const el = query(doc, selector);
     return clean(el && el.getAttribute(attribute));
@@ -196,6 +208,8 @@
     'mc_cid', 'mc_eid', '_hsenc', '_hsmi', 'igshid',
   ]);
 
+  const PATH_ID_HOSTS = ['naukri.com', 'myworkdayjobs.com', 'myworkdaysite.com', 'lever.co', 'ashbyhq.com'];
+
   function canonicalUrl(href) {
     let url;
     try {
@@ -214,6 +228,14 @@
     if (/(^|\.)indeed\./.test(host)) {
       const jk = url.searchParams.get('jk') || url.searchParams.get('vjk');
       if (jk && /^[\w-]+$/.test(jk)) return `https://${host}/viewjob?jk=${jk}`;
+    }
+    // Workday serves the same job under every locale prefix (/en-US/, /de-DE/, …) and without one.
+    if (hostIs(host, 'myworkdayjobs.com') || hostIs(host, 'myworkdaysite.com')) {
+      url.pathname = url.pathname.replace(/^\/[a-z]{2}-[a-z]{2}(?=\/)/i, '');
+    }
+    // On these sites the path alone identifies the job; the query only carries search/session state.
+    if (PATH_ID_HOSTS.some((domain) => hostIs(host, domain)) || (hostIs(host, 'greenhouse.io') && /\/jobs\/\d+/.test(url.pathname))) {
+      url.search = '';
     }
 
     const kept = [...url.searchParams]
@@ -394,7 +416,8 @@
     try {
       return JSON.parse(raw
         .replace(/^\s*(?:<!--|\/\/\s*<!\[CDATA\[)|(?:-->|\/\/\s*\]\]>)\s*$/g, '')
-        .replace(/[\u0000-\u001f]+/g, ' '));
+        .replace(/[\u0000-\u001f]+/g, ' ')
+        .replace(/,\s*([}\]])/g, '$1')); // trailing commas
     } catch {
       return null;
     }
@@ -516,7 +539,7 @@
 
     const parts = title.split(/\s+[|·•–—-]\s+/).map(clean).filter(Boolean);
     m = parts[0].match(/^(.+?)\s+at\s+(.+)$/i);
-    if (m) return { role: m[1], company: stripCareerWords(m[2]) };
+    if (m) return { role: CAREERS_HEADING_RE.test(m[1]) ? '' : m[1], company: stripCareerWords(m[2]) };
     const role = CAREERS_HEADING_RE.test(parts[0]) ? '' : parts[0];
     const company = parts.slice(1).map(stripCareerWords).find(Boolean) || '';
     return { role, company };
@@ -615,7 +638,7 @@
       read: (doc) => ({
         role: pick(doc, 'h1[class*="jd-header-title"]', '[class*="jd-header-title"]', 'h1'),
         company: pick(doc, '[class*="jd-header-comp-name"] > a', '[class*="jd-header-comp-name"] a', '[class*="jd-header-comp-name"]'),
-        location: pick(doc, '[class*="jhc__location"]', '[class*="__location"]', '.location'),
+        location: pickPlaces(doc, '[class*="jhc__location"]', '[class*="__location"]', '.location'),
         salary: pick(doc, '[class*="jhc__salary"]', '[class*="__salary"]', '.salary'),
         yoe: pick(doc, '[class*="jhc__exp"]', '[class*="__exp"]', '.exp'),
         workMode: pick(doc, '[class*="jhc__wfhmode"]', '[class*="wfhmode"]'),
@@ -685,7 +708,7 @@
       read: (doc, url) => ({
         role: pick(doc, '[data-automation-id="jobPostingHeader"]', 'h1'),
         companyFallback: workdayCompany(url),
-        location: stripLabel(pick(doc, '[data-automation-id="locations"] dd', '[data-automation-id="locations"]', '[data-automation-id="location"]'), 'locations?'),
+        location: stripLabel(pickPlaces(doc, '[data-automation-id="locations"]', '[data-automation-id="location"]'), 'locations?'),
         workMode: stripLabel(pick(doc, '[data-automation-id="remoteType"] dd', '[data-automation-id="remoteType"]'), 'remote type'),
         description: pick(doc, '[data-automation-id="jobPostingDescription"]'),
       }),
@@ -731,9 +754,11 @@
     const reader = readerFor(hostnameOf(href));
     if (reader) return Boolean(safely(() => reader.isJobPage(d, href)));
     if (queryAll(d, 'script[type="application/ld+json"]').some((s) => /JobPosting/.test(s.textContent))) return true;
+    if (/[?&]gh_jid=\d+/.test(href)) return true; // Greenhouse embedded on a company site
 
+    // Cheap URL test first; the page text is only read when the URL looks like a job.
     const parsed = safely(() => new URL(href));
-    if (!parsed || !JOB_PATH_RE.test(parsed.pathname + parsed.search) || !query(d, 'h1')) return false;
+    if (!parsed || !JOB_PATH_RE.test(parsed.pathname + parsed.search) || !query(d, 'h1, h2, [role="heading"]')) return false;
     const text = (d.body ? d.body.textContent : '').slice(0, 200000).toLowerCase();
     return JOB_WORDS.filter((w) => text.includes(w)).length >= 2;
   }
