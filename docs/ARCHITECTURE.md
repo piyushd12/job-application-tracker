@@ -69,7 +69,7 @@ sequenceDiagram
     CS-->>U: open panel with pre-filled, editable fields
     CS->>SW: CHECK_DUPLICATE {url}
     SW->>AS: GET ?action=check&url=…&token=…
-    AS->>S: TextFinder on Job Link column
+    AS->>S: scan Job Link column (normalized compare)
     S-->>AS: match row (or none)
     AS-->>SW: {ok:true, found, appliedDate, status, row}
     SW-->>CS: same payload
@@ -78,8 +78,8 @@ sequenceDiagram
     CS->>CS: validate (Company or Role, valid URL)
     CS->>SW: ADD_JOB {job}
     SW->>AS: POST text/plain {action:"add", job, token}
-    AS->>AS: LockService.waitLock, sanitize cells
-    AS->>S: appendRow
+    AS->>AS: LockService.tryLock, sanitize cells
+    AS->>S: setValues on the next free row
     AS-->>SW: {ok:true, row, sheetUrl}
     SW-->>CS: same payload
     CS-->>U: "Saved to row 42 · Open sheet"
@@ -158,7 +158,7 @@ The manifest loads them in order: `extract.js`, `sites.js`, `content.js`. `extra
 
 ### `Applications` tab
 
-The header is in row 1, which is frozen. A filter covers the data range. Data starts at row 2.
+The header is in row 1, which is frozen. Data starts at row 2. `setup()` pre-formats about 1,000 data rows (plain-text columns, date formats, dropdowns, status colors) and a filter covers all of them. When fewer than 50 empty rows remain, `add` inserts 500 more and re-applies the same formatting, so new rows never lose their dropdowns or colors.
 
 | # | Column | Stored as | Format / validation | Set by |
 |---|---|---|---|---|
@@ -193,7 +193,7 @@ Every text column is formatted `@`. This is plain-text formatting, so Sheets nev
 ### Automation
 
 - **Last Updated on status change.** A simple `onEdit(e)` trigger fires when the edited range overlaps column D at row 2 or below. It sets column K to `new Date()` for every edited row, so multi-row pastes are handled too. Edits made by scripts do not fire `onEdit`, so `markGhosted` sets K itself.
-- **Auto-Ghosted.** A daily time trigger runs `markGhosted()`. Rows with status `Applied` or `OA / Assessment` whose Last Updated is older than `GHOST_DAYS` change to `Ghosted`, and their K is updated. If K is blank, Applied Date is used. `GHOST_DAYS` (default `30`) is a constant at the top of `Code.gs`. Setting it to `0` turns the feature off, and `setup()` then removes the trigger.
+- **Auto-Ghosted.** A daily time trigger runs `markGhosted()`. Rows with status `Applied` or `OA / Assessment` whose Last Updated is older than `GHOST_AFTER_DAYS` (default `30`) change to `Ghosted`, and their K is updated. If K is blank, Applied Date is used. Setting `AUTO_GHOST = false` turns the feature off: `markGhosted()` becomes a no-op and the next `setup()` removes the trigger. The **Mark ghosted now** menu item runs the same check on demand, whatever `AUTO_GHOST` says.
 
 ### `Summary` tab (formulas only, rebuilt by `setup()`)
 
@@ -208,7 +208,7 @@ Every text column is formatted `@`. This is plain-text formatting, so Sheets nev
 | Interview rate | `=IFERROR((COUNTIF(D,"Interview")+COUNTIF(D,"Offer")) / Total, 0)` as `%` |
 | Offers | `=COUNTIF(D,"Offer")` |
 | Per status | One row per status: `=COUNTIF(D,status)` and share `=count / COUNTA(D)` |
-| Per source | `=QUERY(Applications!A2:L,"select I, count(I) where I is not null group by I order by count(I) desc label I '', count(I) ''",0)` |
+| Per source | `=QUERY(Applications!A2:L,"select I, count(I) where I <> '' group by I order by count(I) desc label I '', count(I) ''",0)` |
 
 Status is a single current value, so an application that went Interview → Rejected counts as Rejected. The interview rate is therefore a lower bound. Tracking status history would need a history column or a separate tab, and that is out of scope for v1.
 
@@ -247,7 +247,7 @@ type Job = {
 
 | `type` | Payload | Response |
 |---|---|---|
-| `PING` | `{ webAppUrl, secret }` (unsaved form values, so you can test before saving) | `{ ok:true, setup:boolean, version:number }` or `{ ok:false, error }` |
+| `PING` | `{ webAppUrl, secret }` (unsaved form values, so you can test before saving) | `{ ok:true, setup:boolean, version:number, sheetName:string, rows:number }` or `{ ok:false, error }` |
 
 ### Service worker → content script
 
@@ -278,13 +278,13 @@ The base URL is the deployed Web App, `https://script.google.com/macros/s/<id>/e
 
 | Method | Request | Purpose |
 |---|---|---|
-| GET | `?action=ping&token=<secret>` | Connection test. Returns `{ok:true, version, setup}` |
-| GET | `?action=check&url=<canonical>&token=<secret>` | Duplicate lookup (exact match on Job Link via `TextFinder.matchEntireCell`) |
+| GET | `?action=ping&token=<secret>` | Connection test. Returns `{ok:true, version, setup, sheetName, rows}`, where `sheetName` is the spreadsheet's name and `rows` the number of saved jobs |
+| GET | `?action=check&url=<canonical>&token=<secret>` | Duplicate lookup. Both the requested link and every Job Link cell are normalized (lower-cased, no scheme, `www.`, `#hash`, tracking parameters, `/apply` or trailing slash; remaining parameters sorted) and compared, newest row first. Links typed by hand still match |
 | POST | Header `Content-Type: text/plain;charset=utf-8`. Body: `{"action":"add","job":{…},"token":"<secret>"}` | Append a row. `text/plain` makes this a *simple request*, so no CORS preflight is sent |
 
 ### Responses
 
-Always `ContentService` JSON with HTTP 200:
+Always `ContentService` JSON with HTTP 200. Writes are only accepted through POST; a GET with `action=add` returns `UNKNOWN_ACTION`.
 
 ```jsonc
 { "ok": true,  "row": 42, "sheetUrl": "https://docs.google.com/spreadsheets/d/…/edit#gid=0&range=A42" }
@@ -309,18 +309,20 @@ Always `ContentService` JSON with HTTP 200:
 ### Server-side rules
 
 - **Config.** These constants sit at the top of `Code.gs`:
-  - `SECRET = ""`. Empty means no check. Otherwise the request token must equal it.
-  - `GHOST_DAYS = 30`. `0` turns auto-ghosting off.
-  - `SHEET_NAME = "Applications"` and `SUMMARY_NAME = "Summary"`.
-- **Locking.** `add` and `markGhosted` run inside `LockService.getScriptLock().waitLock(10000)` and release it in a `finally` block.
+  - `SECRET = ''`. Empty means no check. Otherwise the request token must equal it.
+  - `AUTO_GHOST = true`. Turns the daily auto-ghost trigger on or off.
+  - `GHOST_AFTER_DAYS = 30`. Days without change before a row is ghosted.
+  - Internal names such as `SHEET_NAME = 'Applications'` and `SUMMARY_NAME = 'Summary'` sit below the settings block.
+- **Locking.** `add` and `markGhosted` run inside `LockService.getScriptLock().tryLock(10000)` and release it in a `finally` block.
 - **Formula-injection guard.** Before writing, any string cell that starts with `=`, `+`, `-`, `@`, tab or CR is prefixed with `'`. This applies to every field, including Notes.
 - **Server re-validation.** Company or Role must be present. `url` must parse as http(s). `status` and `workMode` are coerced to allowed values, with defaults `Applied` and `N/A`. Field lengths are capped at 5,000 characters, well under the 50,000-character limit for a cell.
 - **`setup()` is idempotent.** Running it again repairs the sheet without duplicating anything. It:
-  - Creates the `Applications` tab if it is missing and writes the header row only if it differs.
-  - Freezes row 1, sets column widths and number formats, and creates the filter if there is none.
-  - Clears and re-applies data validation and the status conditional-format rules.
-  - Deletes and re-creates the `Summary` tab's formulas.
-  - Deletes every project trigger for `markGhosted` and re-creates the daily one if `GHOST_DAYS > 0`.
+  - Creates the `Applications` tab if it is missing, makes sure it has at least 1,001 rows, and rewrites the header row.
+  - Freezes row 1 and sets column widths and number formats.
+  - Re-applies data validation and replaces only its own status color rules (rules on other columns are kept).
+  - Creates the filter, or re-creates it over all rows if it is too short, keeping any active column criteria.
+  - Clears and rebuilds the `Summary` tab.
+  - Deletes every project trigger for `markGhosted` and re-creates the daily one (06:00 in the script time zone) if `AUTO_GHOST` is true.
 - **Menu.** `onOpen()` adds a **Job Tracker** menu with **Run setup** and **Mark ghosted now**.
 
 ---
@@ -516,12 +518,14 @@ Detection is cheap: no description parsing and no regex over the full body unles
   - `canonicalUrl`: LinkedIn view/slug/`currentJobId`, Indeed `jk`/`vjk`, tracking-parameter removal, `gh_jid` kept, `/apply` and trailing slash removed.
   - `sourceFromHost`: every mapped host plus the Company Site fallback.
 - **Fixture tests (`extract.test.js`):** a table of `{ fixture, url, expected }` covering LinkedIn (including a search page with `currentJobId` and stale JSON-LD), Naukri, Indeed, Glassdoor, Greenhouse, Lever, Workday, Ashby, a **JSON-LD-only** page (malformed and `@graph` variants) and a **plain career page** that relies on heuristics only. Each test checks every field and `isJobPage`.
-- **Apps Script tests (`apps-script.test.js`):** `Code.gs` is read as text and run with `node:vm` in a context that provides small in-memory mocks of `SpreadsheetApp` (a sheet backed by a 2D array, with `getRange`/`getValues`/`setValues`/`appendRow`/`getLastRow`/`createTextFinder`), `LockService`, `ContentService`, `ScriptApp`, `Utilities` and `Session`. `Code.gs` contains no Node-specific code. The tests cover:
+- **Apps Script tests (`apps-script.test.js`):** `Code.gs` is read as text and run with `node:vm` in a context that provides small in-memory mocks of `SpreadsheetApp` (a sheet backed by a 2D array, with `getRange`/`getValues`/`setValues`/`getLastRow`/`insertRowsAfter`; formatting calls are absorbed by a chainable proxy), `LockService`, `ContentService`, `ScriptApp` and `Utilities`. `Code.gs` contains no Node-specific code. The tests cover:
   - Each `doGet`/`doPost` action and error code
   - The token check, both enabled and disabled
   - Formula-injection prefixing
   - `onEdit` updating Last Updated only for Status edits
-  - `markGhosted` thresholds and `GHOST_DAYS = 0`
+  - `markGhosted` thresholds and `AUTO_GHOST = false`
+  - Row top-up when the pre-formatted rows run out
+  - Duplicate lookup by normalized link
   - `setup()` idempotency: running it twice gives the same validation, rules and trigger count
 - **Manual QA checklist** (to be added to the README in M7):
   - Load unpacked in Chrome, Edge and Brave.
