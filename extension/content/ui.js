@@ -7,8 +7,12 @@
   'use strict';
 
   const ROOT_ID = 'job-tracker-ext-root';
+  const HELLO_EVENT = 'job-tracker-ext:hello';
 
-  // A re-injected copy (for example after the extension was reloaded) replaces the orphaned old UI.
+  // Only one live copy per page. The toolbar fallback can inject a copy while the manifest copy is
+  // still loading, and reloading the extension orphans the old copy. Every copy answers this event:
+  // a live one cancels it (so this newcomer stops here), an orphaned one tears itself down.
+  if (!document.dispatchEvent(new CustomEvent(HELLO_EVENT, { cancelable: true }))) return;
   const stale = document.getElementById(ROOT_ID);
   if (stale) stale.remove();
 
@@ -32,7 +36,10 @@
   const DEFAULT_SETTINGS = { webAppUrl: '', buttonMode: 'auto', hiddenSites: [] };
   const DETECT_DEBOUNCE_MS = 500;
   const DETECT_MAX_WAIT_MS = 2000;
+  // Enough for a slow SPA to render its content; after that the same URL is not re-checked.
+  const MAX_CHECKS_PER_URL = 10;
   const ISOLATED_EVENTS = ['keydown', 'keyup', 'keypress', 'input', 'beforeinput', 'paste', 'copy', 'cut'];
+  const WINDOW_CAPTURE_EVENTS = ['keydown', 'keyup', 'keypress', 'focusin', 'focusout'];
   const RELOADED = { ok: false, error: 'RELOADED', message: 'The extension was updated. Reload this page and try again.' };
 
   const ICON = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="7" width="18" height="13" rx="2"/><path d="M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/><path d="m9 13.5 2 2 4-4"/></svg>';
@@ -41,7 +48,7 @@
   const TEMPLATE = `
 <style>
   :host {
-    --bg: #ffffff; --fg: #1f2328; --muted: #5f6670; --border: #d6dae0; --field: #f6f8fa;
+    --bg: #ffffff; --fg: #1f2328; --muted: #5f6670; --border: #d6dae0; --field: #f6f8fa; --field-border: #848d97;
     --accent: #2563eb; --accent-fg: #ffffff; --danger: #b42318; --danger-bg: #fef3f2;
     --warn-bg: #fff4dc; --warn-fg: #7a4d00; --ok-bg: #ceead6; --ok-fg: #0d652d;
     --shadow: 0 12px 40px rgba(15, 23, 42, .18), 0 2px 6px rgba(15, 23, 42, .08);
@@ -49,7 +56,7 @@
   }
   @media (prefers-color-scheme: dark) {
     :host {
-      --bg: #1d2127; --fg: #e6e8eb; --muted: #9aa3ad; --border: #3a414a; --field: #262b33;
+      --bg: #1d2127; --fg: #e6e8eb; --muted: #9aa3ad; --border: #3a414a; --field: #262b33; --field-border: #6e7681;
       --accent: #6b9bff; --accent-fg: #0b1220; --danger: #ff9b91; --danger-bg: #3a1f1f;
       --warn-bg: #3a2f12; --warn-fg: #f6c86b; --ok-bg: #173b26; --ok-fg: #7ee2a8;
       --shadow: 0 12px 40px rgba(0, 0, 0, .55); --scheme: dark;
@@ -100,7 +107,7 @@
   .field > span:first-child { font-size: 12px; font-weight: 600; color: var(--muted); }
   input, select, textarea {
     width: 100%; min-width: 0; padding: 7px 9px; font: inherit; color: inherit;
-    background: var(--field); border: 1px solid var(--border); border-radius: 8px;
+    background: var(--field); border: 1px solid var(--field-border); border-radius: 8px;
   }
   input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   [aria-invalid="true"] { border-color: var(--danger); }
@@ -122,7 +129,7 @@
   }
   button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
-  .success { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 32px 16px; text-align: center; }
+  .success { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: safe center; gap: 12px; padding: 32px 16px; overflow-y: auto; text-align: center; }
   .check { width: 52px; height: 52px; display: grid; place-items: center; border-radius: 50%; background: var(--ok-bg); color: var(--ok-fg); font-size: 26px; }
   .success p { margin: 0; font-size: 15px; }
   .success a { color: var(--accent); font-weight: 600; }
@@ -204,6 +211,9 @@
   let panelOpen = false;
   let saving = false;
   let lastUrl = '';
+  let checksLeft = MAX_CHECKS_PER_URL;
+  let session = 0; // bumped on every open/close so late replies for an earlier panel are ignored
+  let returnFocus = null;
   let duplicateRequest = 0;
   let detectTimer = 0;
   let firstPendingAt = 0;
@@ -216,7 +226,7 @@
     } catch {
       // Keep defaults; the tab still works in auto mode.
     }
-    renderTab();
+    redetect();
   }
 
   function onStorageChanged(changes, area) {
@@ -224,7 +234,7 @@
     for (const [key, { newValue }] of Object.entries(changes)) {
       if (key in DEFAULT_SETTINGS) settings[key] = newValue ?? DEFAULT_SETTINGS[key];
     }
-    renderTab();
+    redetect();
   }
 
   function isHiddenSite() {
@@ -251,14 +261,9 @@
 
   // ----- Job detection (URL changes and DOM mutations, debounced) ------------
 
-  function detect() {
-    lastUrl = location.href;
-    try {
-      isJobPage = Extract.isLikelyJobPage(document, location.href);
-    } catch {
-      isJobPage = false;
-    }
-    renderTab();
+  /** Detection only matters in auto mode on a site that isn't hidden. */
+  function detectionWanted() {
+    return settings.buttonMode !== 'always' && settings.buttonMode !== 'never' && !isHiddenSite();
   }
 
   function onPageChange() {
@@ -267,8 +272,28 @@
       return;
     }
     if (!host.isConnected) document.documentElement.append(host);
-    if (location.href === lastUrl && isJobPage) return;
-    detect();
+    if (location.href !== lastUrl) {
+      lastUrl = location.href;
+      checksLeft = MAX_CHECKS_PER_URL;
+      isJobPage = false;
+    } else if (isJobPage || checksLeft <= 0) {
+      return;
+    }
+    if (detectionWanted()) {
+      checksLeft--;
+      try {
+        isJobPage = Extract.isLikelyJobPage(document, location.href);
+      } catch {
+        isJobPage = false;
+      }
+    }
+    renderTab();
+  }
+
+  /** Settings changed: check the current URL again from scratch. */
+  function redetect() {
+    lastUrl = '';
+    onPageChange();
   }
 
   /** Debounced, but never postponed longer than DETECT_MAX_WAIT_MS on pages that mutate constantly. */
@@ -288,6 +313,8 @@
   // ----- Panel ------------------------------------------------------------
 
   function openPanel() {
+    if (!panelOpen) returnFocus = shadow.activeElement === ui.openButton ? ui.openButton : document.activeElement;
+    session++;
     let job;
     try {
       job = Extract.extractJob(document, location.href);
@@ -309,9 +336,15 @@
 
   function closePanel() {
     panelOpen = false;
+    session++;
     duplicateRequest++; // ignore any reply still in flight
     ui.panel.hidden = true;
     renderTab();
+    const target = returnFocus;
+    returnFocus = null;
+    if (target && target !== host && target.isConnected && typeof target.focus === 'function') {
+      target.focus({ preventScroll: true });
+    }
   }
 
   function fillForm(job) {
@@ -364,9 +397,10 @@
 
     hideError();
     setSaving(true);
+    const current = session;
     const res = await sendMessage({ type: 'add-job', job });
+    if (current !== session) return; // closed or reopened meanwhile
     setSaving(false);
-    if (!panelOpen) return;
     if (res.ok) showSuccess(res);
     else showError(res);
   }
@@ -428,11 +462,11 @@
 
   // ----- Keyboard isolation -------------------------------------------------
 
-  // Keys typed in the panel must not trigger the site's shortcuts. Events from inside a closed
-  // shadow root are retargeted to the host, so stop them there. A capture listener on window also
-  // runs before the site's own document/element listeners (only window-capture listeners the page
-  // registered earlier can still see the key first).
-  function onWindowKey(event) {
+  // Keys typed in the panel must not trigger the site's shortcuts, and focus moving into it must not
+  // trip the site's focus traps. Events from inside a closed shadow root are retargeted to the host,
+  // so stop them there. A capture listener on window also runs before the site's own document/element
+  // listeners (only window-capture listeners the page registered earlier can still see them first).
+  function onWindowCapture(event) {
     if (event.target !== host) return;
     if (event.type === 'keydown' && event.key === 'Escape' && panelOpen) {
       event.preventDefault();
@@ -462,6 +496,11 @@
     } catch {
       return RELOADED;
     }
+  }
+
+  function onHello(event) {
+    if (isExtensionAlive()) event.preventDefault();
+    else teardown();
   }
 
   function onRuntimeMessage(message, sender, sendResponse) {
@@ -494,7 +533,8 @@
     clearTimeout(detectTimer);
     window.removeEventListener('popstate', scheduleDetect);
     window.removeEventListener('hashchange', scheduleDetect);
-    for (const type of ['keydown', 'keyup', 'keypress']) window.removeEventListener(type, onWindowKey, true);
+    document.removeEventListener(HELLO_EVENT, onHello);
+    for (const type of WINDOW_CAPTURE_EVENTS) window.removeEventListener(type, onWindowCapture, true);
     host.remove();
   }
 
@@ -512,7 +552,8 @@
   field('url').addEventListener('change', onLinkChanged);
 
   for (const type of ISOLATED_EVENTS) host.addEventListener(type, stopAtHost);
-  for (const type of ['keydown', 'keyup', 'keypress']) window.addEventListener(type, onWindowKey, true);
+  for (const type of WINDOW_CAPTURE_EVENTS) window.addEventListener(type, onWindowCapture, true);
+  document.addEventListener(HELLO_EVENT, onHello);
 
   window.addEventListener('popstate', scheduleDetect);
   window.addEventListener('hashchange', scheduleDetect);
@@ -521,6 +562,5 @@
   chrome.storage.onChanged.addListener(onStorageChanged);
 
   document.documentElement.append(host);
-  detect();
-  loadSettings();
+  loadSettings(); // runs the first detection once the button mode is known
 })();
