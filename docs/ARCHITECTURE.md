@@ -65,7 +65,7 @@ sequenceDiagram
     CS->>CS: isJobPage? (site reader / JSON-LD / heuristics)
     CS-->>P: show floating tab (Shadow DOM)
     U->>CS: click tab (or toolbar icon / Alt+Shift+J → SW → open-panel)
-    CS->>CS: extract(document, location.href) → fields
+    CS->>CS: JobExtract.extractJob(document, location.href) → job
     CS-->>U: open panel with pre-filled, editable fields
     CS->>SW: check-duplicate {url}
     SW->>AS: GET ?action=check&url=…&token=…
@@ -97,8 +97,7 @@ The service worker makes every network call. Content scripts run under the page'
 │   ├── manifest.json
 │   ├── background.js          # service worker: fetch, commands, action click, onInstalled
 │   ├── content/
-│   │   ├── extract.js         # pure logic: field parsers, JSON-LD, heuristics, canonicalUrl, source map
-│   │   ├── sites.js           # per-host site readers (data + small read functions)
+│   │   ├── extract.js         # pure logic: site readers, JSON-LD, heuristics, field parsers, canonicalUrl, source map
 │   │   └── content.js         # Shadow DOM button + panel, SPA watcher, messaging
 │   ├── options/
 │   │   ├── options.html
@@ -121,17 +120,17 @@ The service worker makes every network call. Content scripts run under the page'
 
 ### Module loading without a build step
 
-`extract.js` and `sites.js` use a small UMD wrapper. Chrome loads them as content scripts that share the isolated-world global, and Node loads them with `require` for tests:
+`extract.js` uses a small UMD wrapper. Chrome loads it as a content script that sets a global in the extension's isolated world, and Node loads it with `require` for tests:
 
 ```js
 (function (root, factory) {
   const api = factory();
   if (typeof module === 'object' && module.exports) module.exports = api;
-  else root.JobExtract = api;          // sites.js exports root.JobSites
-})(globalThis, function () { /* … */ return { extract, parseYoe, /* … */ }; });
+  else root.JobExtract = api;
+})(globalThis, function () { /* … */ return { extractJob, isLikelyJobPage, /* … */ }; });
 ```
 
-The manifest loads them in order: `extract.js`, `sites.js`, `content.js`. `extract.js` does not import `sites.js`. The readers are passed in, as `JobExtract.extract(document, url, JobSites)`, so each file can be tested alone.
+The public API is `JobExtract = { extractJob, isLikelyJobPage, canonicalUrl, extractYOE, workModeFrom, salaryFromText }`, plus `sourceFromHost`, `readJsonLdPostings` and `SOURCE_NAMES` for the UI and tests. The site readers live inside `extract.js` as a plain array, so the whole extraction pipeline is one file with no load-order coupling. The manifest loads `extract.js` before `ui.js`.
 
 ### Manifest essentials
 
@@ -338,17 +337,17 @@ A deployment that is not shared with *Anyone* redirects to `accounts.google.com`
 
 For every field, the extractor tries three layers in order and takes the **first non-empty value**:
 
-1. **Site reader.** It is chosen by hostname from `sites.js`. Each reader is `{ name, hosts, isJobPage(doc, url), read(doc, url, h) }`, where `h` is a small helper kit (`text(...selectors)`, `attr(sel, name)`, `labelValue(label)`). Each field lists several fallback selectors, in this order of preference:
+1. **Site reader.** It is chosen by hostname from the `SITE_READERS` array in `extract.js`. Each reader is `{ name, matches(host), isJobPage(doc, url), read(doc, url) }`, and `read` uses shared helpers (`pick(...selectors)`, `pickAll`, `pickAttr`, `labelValue(labels)`). Each field lists several fallback selectors, in this order of preference:
    1. Stable attributes: `data-testid`, `data-automation-id`, `data-test`, `data-qa`, `itemprop`, `id`
    2. Semantic structure (`h1`, `[role=heading]`)
    3. Substring class matches for hashed CSS-module classes, such as `[class*="jd-header-title"]`
    4. Full class names, used last
 
-   Readers exist for LinkedIn, Naukri, Indeed, Glassdoor, Greenhouse, Lever, Workday (`myworkdayjobs.com`, `myworkdaysite.com`) and Ashby. Readers also derive the company from the URL where the platform encodes it: the Greenhouse/Lever/Ashby path slug and the Workday subdomain.
+   Readers exist for LinkedIn, Naukri, Indeed, Glassdoor, Greenhouse, Lever, Workday (`myworkdayjobs.com`, `myworkdaysite.com`) and Ashby. Readers also derive a `companyFallback` from the URL where the platform encodes it: the Greenhouse/Lever/Ashby path slug and the Workday tenant. A slug like `acmerobotics` is a poor display name, so the fallback is used only after the JSON-LD company: the order for Company is site reader → JSON-LD → URL fallback → generic.
 2. **schema.org `JobPosting` JSON-LD.** See below.
 3. **Generic heuristics.** See below.
 
-The extractor returns `{ fields, meta: { isJobPage, layer: { company:"site"|"jsonld"|"generic", … } } }`. The `meta.layer` value is for debugging and tests only.
+`extractJob(doc, url)` returns a `Job` object (§5) with every field filled, `status: "Applied"`, today's date and empty notes. `isLikelyJobPage(doc, url)` is the separate, cheaper check used for the floating button.
 
 ### Initial site-reader targets
 
@@ -377,7 +376,7 @@ These are starting points. The fixtures pin them, and when a site changes its DO
   - `baseSalary` / `estimatedSalary` → salary (see below)
   - `experienceRequirements.monthsOfExperience` → `⌊m/12⌋+ yrs`. Text or `description` → YOE parser
   - `description` (HTML stripped) → description text for the YOE, work-mode and salary parsers
-- **Stale-data guard for SPAs.** If a visible role exists (from the site reader or `h1`) and the normalized JSON-LD title neither contains it nor is contained by it, and their token overlap is below 50 %, the whole JSON-LD block is ignored. It belongs to a previously viewed job.
+- **Stale-data guard for SPAs.** If the site reader found the visible role, only a posting whose normalized title contains it, is contained by it, or shares at least 50 % of its words is used. Otherwise all JSON-LD is ignored, because it belongs to a previously viewed job. The guard is keyed to site readers only: on generic pages the `h1` is often a company or careers heading, and comparing against it would throw away good JSON-LD.
 
 ### Generic heuristics layer
 
@@ -391,7 +390,7 @@ These are starting points. The fixtures pin them, and when a site changes its DO
 
 ### Field rules
 
-**YOE** (`parseYoe(text) → string`)
+**YOE** (`extractYOE(text, { requireContext = true }) → string`)
 
 - Normalize the text first: NBSP becomes a space, en/em dashes become `-`, and the text is lower-cased.
 - Patterns:
@@ -402,14 +401,14 @@ These are starting points. The fixtures pin them, and when a site changes its DO
   - Number words: `three (3) years`, `five years`, from one to twenty
 - All candidate matches from all patterns are collected with their index. **The earliest valid match wins.**
 - A match is valid only if all of these hold:
-  - `experience` or `exp` appears within about 90 characters around it.
+  - `experience` or `exp` appears within about 90 characters around it. Site fields that are already about experience (Naukri's experience chip, JSON-LD `experienceRequirements`) pass `requireContext: false`.
   - No number is above 30.
-  - In a range, min < max.
+  - In a range, min < max. A number right after a dash is never read on its own, so `5-3 years` gives nothing rather than `3 yrs`.
   - It is not followed by `old`, `ago` or `of age`.
 - Output: `2-5 yrs`, `5+ yrs` (plus and minimum forms both become `N+ yrs`), `3 yrs`.
 - If nothing matches but the text contains `fresher`, `entry level`, `new grad` or `recent graduate`, the result is `Fresher`. Otherwise it is `N/A`.
 
-**Work mode** (`detectWorkMode({ explicit, location, header, description })`)
+**Work mode** (`workModeFrom({ explicit, location, header, description })`; a plain string is treated as location text)
 
 1. Explicit fields: JSON-LD `jobLocationType`, the LinkedIn workplace-type pill, Lever `workplaceTypes`, Workday `remoteType`.
 2. Loose match on location and header text: `hybrid`, `remote` / `work from home` / `wfh`, `on-site` / `onsite` / `in office` / `work from office` / `wfo`.
@@ -425,7 +424,7 @@ Within a layer, **Hybrid > Remote > On-site**. If nothing matches, the result is
 
 1. JSON-LD `baseSalary` or `estimatedSalary` (`{currency, value:{minValue,maxValue,value,unitText}}`). INR yearly amounts of 1 lakh or more are shown as `12-18 LPA`. Others are shown as `USD 120,000-150,000 / year`.
 2. Site fields: Naukri salary, the Indeed salary pill, the Glassdoor estimate. Values matching `not disclosed`, `competitive` or `as per industry` are ignored.
-3. Description: only amounts within about 60 characters of `salary`, `ctc`, `compensation`, `pay`, `package`, `stipend` or `lpa`.
+3. Description (`salaryFromText(text)`): only amounts within about 60 characters of `salary`, `ctc`, `compensation`, `pay`, `package`, `stipend` or `lpa`.
    - Currencies: `₹`, `Rs.`, `INR`, `$`, `USD`, `€`, `£`
    - Units: `k`, `L`, `lakh`, `LPA`, `Cr`
    - Ranges: `12-18 LPA`, `₹ 8,00,000 - 12,00,000`
@@ -466,7 +465,9 @@ A page counts as a job page if any of these is true:
 
 - A site reader's `isJobPage` is true, for example LinkedIn `/jobs/view/` or `currentJobId`, Indeed `jk`/`vjk`, or a Workday `/job/` path.
 - JSON-LD contains a `JobPosting`.
-- **Generic:** the URL path matches `job|career|position|opening|vacanc|requisition`, an `h1` exists, and the description block contains at least two of `responsibilit`, `requirement`, `qualification`, `experience` and `apply`.
+- **Generic** (only for hosts without a site reader): the URL path or query matches `job|career|position|opening|vacanc|requisition|posting`, an `h1` exists, and the page text contains at least two of `responsibilit`, `requirement`, `qualification`, `experience` and `apply`.
+
+For hosts with a site reader, the reader's answer is final. LinkedIn's feed, for example, is never treated as a job page by the generic rule.
 
 Detection is cheap: no description parsing and no regex over the full body unless the generic URL test passes first.
 
