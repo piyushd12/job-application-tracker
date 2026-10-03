@@ -6,6 +6,9 @@
 const DEFAULT_SETTINGS = { webAppUrl: '', secret: '', buttonMode: 'auto', hiddenSites: [] };
 const CONTENT_SCRIPTS = ['content/extract.js', 'content/ui.js'];
 const REQUEST_TIMEOUT_MS = 20000;
+/** Keep in sync with WEB_APP_URL_RE in options/options.js. The token is only ever sent to a URL of this shape. */
+const WEB_APP_URL_RE = /^https:\/\/script\.google\.com\/(?:a\/macros\/[^/]+\/|macros\/)s\/[\w-]+\/exec$/;
+const UNSUPPORTED_PAGE_TITLE = "Can't save from this page: browser pages, the Chrome Web Store and local files are off-limits to extensions.";
 
 const ERROR_MESSAGES = {
   NOT_CONFIGURED: 'Add your Web App URL in Settings first.',
@@ -46,10 +49,22 @@ async function openPanel(tab) {
   // activeTab grants access because the user just clicked or pressed the shortcut.
   try {
     await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: CONTENT_SCRIPTS });
+    if (await sendToTab(tab.id, { type: 'open-panel' })) return;
   } catch {
-    return; // Pages like chrome:// and the Web Store can't be scripted.
+    // Pages like chrome://, the Web Store and file:// (without file access) can't be scripted.
   }
-  await sendToTab(tab.id, { type: 'open-panel' });
+  await flagUnsupportedPage(tab.id);
+}
+
+/** Tells the user why nothing happened. Chrome clears per-tab badge and title when the tab navigates. */
+async function flagUnsupportedPage(tabId) {
+  try {
+    await chrome.action.setBadgeBackgroundColor({ tabId, color: '#b42318' });
+    await chrome.action.setBadgeText({ tabId, text: '!' });
+    await chrome.action.setTitle({ tabId, title: UNSUPPORTED_PAGE_TITLE });
+  } catch {
+    // The tab was closed meanwhile.
+  }
 }
 
 async function sendToTab(tabId, message) {
@@ -118,12 +133,8 @@ async function callWebApp({ webAppUrl, secret }, { method = 'GET', params = {}, 
 }
 
 function parseWebAppUrl(value) {
-  try {
-    const url = new URL(String(value || '').trim());
-    return url.protocol === 'https:' && url.hostname === 'script.google.com' ? url.href : null;
-  } catch {
-    return null;
-  }
+  const url = String(value || '').trim();
+  return WEB_APP_URL_RE.test(url) ? url : null;
 }
 
 /**
