@@ -64,10 +64,10 @@ sequenceDiagram
     P->>CS: document_idle / SPA URL change
     CS->>CS: isJobPage? (site reader / JSON-LD / heuristics)
     CS-->>P: show floating tab (Shadow DOM)
-    U->>CS: click tab (or toolbar icon / Alt+Shift+J → SW → TOGGLE_PANEL)
+    U->>CS: click tab (or toolbar icon / Alt+Shift+J → SW → open-panel)
     CS->>CS: extract(document, location.href) → fields
     CS-->>U: open panel with pre-filled, editable fields
-    CS->>SW: CHECK_DUPLICATE {url}
+    CS->>SW: check-duplicate {url}
     SW->>AS: GET ?action=check&url=…&token=…
     AS->>S: scan Job Link column (normalized compare)
     S-->>AS: match row (or none)
@@ -76,7 +76,7 @@ sequenceDiagram
     CS-->>U: "Already saved on 03 Oct 2026, status Applied" (if found)
     U->>CS: edit fields, click Save
     CS->>CS: validate (Company or Role, valid URL)
-    CS->>SW: ADD_JOB {job}
+    CS->>SW: add-job {job}
     SW->>AS: POST text/plain {action:"add", job, token}
     AS->>AS: LockService.tryLock, sanitize cells
     AS->>S: setValues on the next free row
@@ -141,12 +141,12 @@ The manifest loads them in order: `extract.js`, `sites.js`, `content.js`. `extra
   "permissions": ["storage", "activeTab", "scripting"],
   "host_permissions": ["https://script.google.com/*", "https://script.googleusercontent.com/*"],
   "background": { "service_worker": "background.js" },
-  "action": { "default_title": "Save job to sheet" },
+  "action": { "default_title": "Save this job to your sheet (Alt+Shift+J)" },
   "commands": { "_execute_action": { "suggested_key": { "default": "Alt+Shift+J" } } },
-  "options_page": "options/options.html",
+  "options_ui": { "page": "options/options.html", "open_in_tab": true },
   "content_scripts": [{
     "matches": ["http://*/*", "https://*/*"],
-    "js": ["content/extract.js", "content/sites.js", "content/content.js"],
+    "js": ["content/extract.js", "content/ui.js"],
     "run_at": "document_idle"
   }]
 }
@@ -216,7 +216,7 @@ Status is a single current value, so an application that went Interview → Reje
 
 ## 5. Message contracts
 
-All messages use `chrome.runtime.sendMessage` or `chrome.tabs.sendMessage` with a `type` field. Async handlers `return true` and reply through `sendResponse`.
+All messages use `chrome.runtime.sendMessage` or `chrome.tabs.sendMessage` with a kebab-case `type` field. The service worker's router returns `true` so it can reply asynchronously through `sendResponse`. Every failure reply from the service worker has the shape `{ ok:false, error:Code, message:string }`, where `message` is the friendly text from §6, so the panel and the options page share one set of messages.
 
 ### Job object
 
@@ -240,22 +240,23 @@ type Job = {
 
 | `type` | Payload | Response |
 |---|---|---|
-| `ADD_JOB` | `{ job: Job }` | `{ ok:true, row:number, sheetUrl:string }` or `{ ok:false, error:Code }` |
-| `CHECK_DUPLICATE` | `{ url: string }` (canonical) | `{ ok:true, found:false }` or `{ ok:true, found:true, row, appliedDate:"03 Oct 2026", status }` or `{ ok:false, error }` |
+| `add-job` | `{ job: Job }` | `{ ok:true, row:number, sheetUrl:string }` or `{ ok:false, error, message }` |
+| `check-duplicate` | `{ url: string }` (canonical) | `{ ok:true, found:false }` or `{ ok:true, found:true, row, appliedDate:"03 Oct 2026", status }` or `{ ok:false, error, message }` |
+| `open-options` | none | Opens the options page (content scripts can't call `runtime.openOptionsPage`) |
 
 ### Options page → service worker
 
 | `type` | Payload | Response |
 |---|---|---|
-| `PING` | `{ webAppUrl, secret }` (unsaved form values, so you can test before saving) | `{ ok:true, setup:boolean, version:number, sheetName:string, rows:number }` or `{ ok:false, error }` |
+| `ping` | `{ webAppUrl, secret }` (unsaved form values, so you can test before saving) | `{ ok:true, setup:boolean, version:number, sheetName:string, rows:number }` or `{ ok:false, error, message }` |
 
 ### Service worker → content script
 
 | `type` | Sent when | Effect |
 |---|---|---|
-| `TOGGLE_PANEL` | `chrome.action.onClicked` (also fired by the `_execute_action` command, Alt+Shift+J) | Open the panel, or close it if it is open. This works even when the page is not detected as a job page, the site is hidden, or the mode is `never`. |
+| `open-panel` | `chrome.action.onClicked` (also fired by the `_execute_action` command, Alt+Shift+J) | Re-extract and open the panel. This works even when the page is not detected as a job page, the site is hidden, or the mode is `never`. |
 
-If `tabs.sendMessage` fails because no content script is in the tab (the tab was open before install, or the extension was updated), the worker injects the three content files with `chrome.scripting.executeScript`. The `activeTab` grant from the click or shortcut covers this. It then retries the message once. Pages where injection is forbidden, such as `chrome://` and the Web Store, fail silently.
+If no Web App URL is saved yet, the toolbar click opens the options page instead. If `tabs.sendMessage` fails because no content script is in the tab (the tab was open before install, or the extension was updated), the worker injects both content files with `chrome.scripting.executeScript`. The `activeTab` grant from the click or shortcut covers this. It then retries the message once. Pages where injection is forbidden, such as `chrome://` and the Web Store, fail silently.
 
 ### Settings (`chrome.storage.sync`)
 
@@ -296,7 +297,7 @@ Always `ContentService` JSON with HTTP 200. Writes are only accepted through POS
 | Code | Raised by | Meaning | Friendly message in panel/options |
 |---|---|---|---|
 | `NOT_CONFIGURED` | Service worker | No Web App URL saved | "Add your Web App URL in Settings first." (with a link to options) |
-| `AUTH_PAGE` | Service worker | The response was HTML or came from `accounts.google.com`, not JSON | "Google returned a sign-in page. Redeploy the Web App with *Who has access: Anyone*." |
+| `NOT_PUBLIC` | Service worker | The response was a Google sign-in page, or the request was redirected away from the script hosts (see below) | "Google returned a sign-in page. Redeploy the Web App with *Who has access: Anyone*." |
 | `NETWORK` | Service worker | fetch failed or the 20 s timeout was reached (`AbortSignal.timeout`) | "Couldn't reach Google. Check your connection and try again." |
 | `BAD_RESPONSE` | Service worker | The body is not valid JSON in the expected shape | "Unexpected reply from the Web App. Is the URL the `/exec` link?" |
 | `BAD_TOKEN` | Apps Script | `SECRET` is set and the token doesn't match | "Secret token doesn't match the one in Code.gs." |
@@ -305,6 +306,10 @@ Always `ContentService` JSON with HTTP 200. Writes are only accepted through POS
 | `SETUP_REQUIRED` | Apps Script | The `Applications` tab or its header is missing | "Sheet isn't set up. In the sheet: Job Tracker → Run setup." |
 | `LOCK_TIMEOUT` | Apps Script | `LockService` could not get the lock within 10 s | "The sheet is busy. Try again in a moment." |
 | `INTERNAL` | Apps Script | Any other exception (the message is logged, not returned) | "Something went wrong in the script. Check Executions in Apps Script." |
+
+### Detecting a Web App that isn't public
+
+A deployment that is not shared with *Anyone* redirects to `accounts.google.com`. The extension has no host permission there, so the followed `fetch` fails like a network error. When a request fails (and it was not a timeout), the service worker sends one more request to the same URL with `redirect: "manual"`. If that returns an `opaqueredirect`, the server is reachable and was sending us elsewhere, so the error is `NOT_PUBLIC`; otherwise it is `NETWORK`. If Chrome does follow the redirect, the HTML sign-in page is detected from the final URL or the body instead. Requests use `credentials: "omit"`, so the result never depends on the user's Google cookies.
 
 ### Server-side rules
 
