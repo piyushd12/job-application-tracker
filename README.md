@@ -58,6 +58,8 @@ The full design is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Indeed (all country domains) | Workday (`myworkdayjobs.com`, `myworkdaysite.com`) |
 | Glassdoor (all country domains) | Ashby |
 
+Greenhouse boards embedded on a company's own careers page (links with `?gh_jid=`) are detected too. The job details sit inside Greenhouse's frame there, which the page can't read, so the panel fills in the company and link, and the role usually needs typing.
+
 The **Source** column is also filled automatically for SmartRecruiters, iCIMS, Wellfound, Instahyre, Foundit, Cutshort, Hirist, Internshala, Taleo, SuccessFactors, Oracle Cloud, BambooHR, Workable, Recruitee, Jobvite, Teamtailor and Zoho Recruit. Any other site is labelled *Company Site*, and you can always edit it.
 
 ## The sheet
@@ -75,7 +77,7 @@ Running `setup` creates an **Applications** tab with these columns:
 | YOE | Years of experience from the description, e.g. `3+ yrs`, `2-5 yrs`, `Fresher`, `N/A` (stored as text) |
 | Salary / CTC | From structured data, the site, or the description (supports `12-18 LPA`, `₹`, `$`, `€`, `£`) |
 | Source | LinkedIn, Naukri, Greenhouse, … or Company Site |
-| Job Link | Cleaned link without tracking parameters |
+| Job Link | Cleaned link without tracking or search parameters, so the same job always gets the same link |
 | Last Updated | Set when the row is added and whenever Status changes |
 | Notes | Anything you like |
 
@@ -156,7 +158,7 @@ More ways to use it:
 | `AUTO_GHOST` | `true` | Every day, mark **Applied** and **OA / Assessment** rows as **Ghosted** when nothing has changed for `GHOST_AFTER_DAYS`. |
 | `GHOST_AFTER_DAYS` | `30` | Days without a change before a row is ghosted. |
 
-After changing these, save the script, run **Job Tracker → Run setup** (this re-creates or removes the daily trigger), and deploy a new version if you changed `SECRET`. The daily job runs around 06:00 in the script's time zone, set by `timeZone` in `appsscript.json`.
+After changing these, save the script, run **Job Tracker → Run setup** (this re-creates or removes the daily trigger), and deploy a new version if you changed `SECRET`. The daily job runs around 06:00 in the spreadsheet's time zone (**File → Settings → Time zone** in the sheet); run setup again after changing the time zone.
 
 ### Extension settings
 
@@ -180,7 +182,7 @@ After changing these, save the script, run **Job Tracker → Run setup** (this r
 | `script.google.com`, `script.googleusercontent.com` | Lets the extension call your Apps Script Web App. Google serves the script's responses from `googleusercontent.com`. |
 | Content script on all `http`/`https` pages | Needed to recognize job postings on *any* website and read their fields. This is why Chrome says the extension can "read and change all your data on all websites". The content script only reads the page. It makes no network requests and sends nothing until you click **Save**. |
 
-**About "Who has access: Anyone".** The extension calls your Web App without your Google login, so the deployment has to accept anonymous requests. The script still runs as you, and it can only append rows to this sheet and look up existing links. Anyone who learned your Web App URL could add rows, so set a `SECRET` for extra protection. It is a simple shared token, sent in requests and stored in your browser profile, so pick a random value you don't use anywhere else.
+**About "Who has access: Anyone".** The extension calls your Web App without your Google login, so the deployment has to accept anonymous requests. The script still runs as you, and it can only append rows to this sheet, look up existing links, and report the spreadsheet's name and row count for **Test connection**. Anyone who learned your Web App URL could do the same, so set a `SECRET` for extra protection. The extension only sends requests (and the secret) to a URL of the form `https://script.google.com/macros/s/…/exec`. It is a simple shared token, sent in requests and stored in your browser profile, so pick a random value you don't use anywhere else.
 
 ## Troubleshooting / FAQ
 
@@ -190,14 +192,14 @@ The Web App isn't deployed for *Anyone*. In Apps Script, open **Deploy → Manag
 **"The secret doesn't match the SECRET in Code.gs."**
 The value in the extension settings must equal `SECRET` in `Code.gs` exactly. If you changed `Code.gs`, deploy a **new version**, because the old version keeps running until you do.
 
-**"The sheet isn't set up yet."**
-In the sheet, choose **Job Tracker → Run setup**, or run `setup` from the Apps Script editor. This also fixes renamed or deleted headers.
+**"The sheet isn't set up yet."** (or `"setup": false` when opening the Web App URL)
+The connection works, but the **Applications** tab with its header row doesn't exist yet. In the sheet, choose **Job Tracker → Run setup**, or in the Apps Script editor pick **`setup`** in the function dropdown next to **Run** (it starts on `doGet`, which does nothing useful on its own) and click **Run**. This also fixes renamed or deleted headers. No new deployment is needed.
 
 **The floating button doesn't show up.**
 - In **Auto** mode the tab only appears on pages that look like job postings. Use the toolbar icon or `Alt+Shift+J` on any page, or switch the button to **Always**.
 - Check **Hidden sites** in the settings. You may have clicked × on this site.
 - Tabs that were already open when you installed or updated the extension need a reload. The toolbar icon works on them right away.
-- Browser pages such as `chrome://` pages and the Chrome Web Store can't be scripted by any extension.
+- Browser pages such as `chrome://` pages, the Chrome Web Store and the built-in PDF viewer can't be scripted by any extension. Clicking the icon there shows a red **!** badge to say so.
 
 **A field was extracted wrong.**
 Edit it in the panel before saving. Every field is editable. Job sites change their layouts from time to time. If a supported site keeps getting something wrong, please [open an issue](https://github.com/piyushd12/job-application-tracking-extension/issues) with the page URL (or the site name), the field and the value you expected.
@@ -228,7 +230,9 @@ Another extension or the browser may already use `Alt+Shift+J`. Pick a different
 │   └── appsscript.json        # Apps Script manifest
 ├── scripts/make-icons.js      # regenerates the icons (Node only, no dependencies)
 ├── tests/                     # node:test suites and synthetic HTML fixtures
-└── docs/ARCHITECTURE.md       # design, contracts, extraction strategy
+└── docs/
+    ├── ARCHITECTURE.md        # design, contracts, extraction strategy
+    └── TESTING.md             # manual QA checklist for a real browser and sheet
 ```
 
 ## Development
@@ -246,8 +250,12 @@ There is no build step. After editing files in `extension/`, click the reload ic
 The tests cover:
 
 - **Field parsers:** years of experience, work mode, salary, canonical URLs and source names.
-- **Extraction fixtures:** one synthetic HTML page per supported site, a structured-data-only page, a plain career page and a stale-data single-page-app case.
+- **Extraction fixtures:** one synthetic HTML page per supported site, a structured-data-only page, a plain career page, a stale-data single-page-app case, and edge cases such as multiple locations, Greenhouse embeds, malformed structured data and very long descriptions.
+- **In-page panel and settings page:** `ui.js` and the options page run in jsdom with a mocked `chrome` API.
+- **Service worker:** where requests and the secret go, and how every reply maps to a message.
 - **Apps Script:** `Code.gs` runs inside `node:vm` with in-memory mocks of `SpreadsheetApp`, `LockService`, `ContentService` and `ScriptApp`.
+
+Automated tests can't cover real sites, real Google deployments or how the panel looks, so [docs/TESTING.md](docs/TESTING.md) has a manual checklist to run in Chrome before a release.
 
 ### Adding a new site reader
 

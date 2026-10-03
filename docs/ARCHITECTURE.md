@@ -111,10 +111,14 @@ The service worker makes every network call. Content scripts run under the page'
 ├── tests/
 │   ├── fixtures/              # synthetic HTML per site + jsonld-only + plain-career page
 │   ├── fields.test.js         # YOE, work mode, salary, canonical URL, source map
-│   ├── extract.test.js        # fixture-driven end-to-end extraction
+│   ├── extract.test.js        # fixture-driven end-to-end extraction, including edge cases
+│   ├── ui.test.js             # ui.js in jsdom: panel flow, key/focus isolation, single instance, detection budget
+│   ├── options.test.js        # options page in jsdom: URL validation, connection test, settings
+│   ├── background.test.js     # background.js in node:vm: token routing, error mapping, toolbar fallback
 │   └── apps-script.test.js    # Code.gs in node:vm with mocked Google services
 ├── docs/
-│   └── ARCHITECTURE.md
+│   ├── ARCHITECTURE.md
+│   └── TESTING.md             # manual QA checklist for a real browser and sheet
 ├── package.json               # "test": "node --test"; devDependencies: jsdom only
 ├── README.md
 └── LICENSE
@@ -194,7 +198,7 @@ Every text column is formatted `@`. This is plain-text formatting, so Sheets nev
 ### Automation
 
 - **Last Updated on status change.** A simple `onEdit(e)` trigger fires when the edited range overlaps column D at row 2 or below. It sets column K to `new Date()` for every edited row, so multi-row pastes are handled too. Edits made by scripts do not fire `onEdit`, so `markGhosted` sets K itself.
-- **Auto-Ghosted.** A daily time trigger runs `markGhosted()`. Rows with status `Applied` or `OA / Assessment` whose Last Updated is older than `GHOST_AFTER_DAYS` (default `30`) change to `Ghosted`, and their K is updated. If K is blank, Applied Date is used. Setting `AUTO_GHOST = false` turns the feature off: `markGhosted()` becomes a no-op and the next `setup()` removes the trigger. The **Mark ghosted now** menu item runs the same check on demand, whatever `AUTO_GHOST` says.
+- **Auto-Ghosted.** A daily time trigger runs `markGhosted()` at 06:00 in the spreadsheet's time zone. Rows with status `Applied` or `OA / Assessment` whose Last Updated is older than `GHOST_AFTER_DAYS` (default `30`) change to `Ghosted`, and their K is updated. If K is blank, Applied Date is used. Rows with neither date (or text that isn't a date) are left alone. Setting `AUTO_GHOST = false` turns the feature off: `markGhosted()` becomes a no-op and the next `setup()` removes the trigger. The **Mark ghosted now** menu item runs the same check on demand, whatever `AUTO_GHOST` says.
 
 ### `Summary` tab (formulas only, rebuilt by `setup()`)
 
@@ -209,7 +213,7 @@ Every text column is formatted `@`. This is plain-text formatting, so Sheets nev
 | Interview rate | `=IFERROR((COUNTIF(D,"Interview")+COUNTIF(D,"Offer")) / Total, 0)` as `%` |
 | Offers | `=COUNTIF(D,"Offer")` |
 | Per status | One row per status: `=COUNTIF(D,status)` and share `=count / COUNTA(D)` |
-| Per source | `=QUERY(Applications!A2:L,"select I, count(I) where I <> '' group by I order by count(I) desc label I '', count(I) ''",0)` |
+| Per source | `=IFERROR(QUERY(Applications!A2:L,"select I, count(I) where I <> '' group by I order by count(I) desc label I '', count(I) ''",0),"")` (QUERY returns `#N/A` on an empty sheet) |
 
 Status is a single current value, so an application that went Interview → Rejected counts as Rejected. The interview rate is therefore a lower bound. Tracking status history would need a history column or a separate tab, and that is out of scope for v1.
 
@@ -257,7 +261,9 @@ type Job = {
 |---|---|---|
 | `open-panel` | `chrome.action.onClicked` (also fired by the `_execute_action` command, Alt+Shift+J) | Re-extract and open the panel. This works even when the page is not detected as a job page, the site is hidden, or the mode is `never`. |
 
-If no Web App URL is saved yet, the toolbar click opens the options page instead. If `tabs.sendMessage` fails because no content script is in the tab (the tab was open before install, or the extension was updated), the worker injects both content files with `chrome.scripting.executeScript`. The `activeTab` grant from the click or shortcut covers this. It then retries the message once. Pages where injection is forbidden, such as `chrome://` and the Web Store, fail silently.
+If no Web App URL is saved yet, the toolbar click opens the options page instead. If `tabs.sendMessage` fails because no content script is in the tab (the tab was open before install, or the extension was updated), the worker injects both content files with `chrome.scripting.executeScript`. The `activeTab` grant from the click or shortcut covers this. It then retries the message once. On pages where injection is forbidden (`chrome://` pages, the Web Store, `file://` without file access, the PDF viewer) the worker shows a red **!** badge on the icon for that tab, with a tooltip that explains why. Chrome clears per-tab badges when the tab navigates.
+
+**One live content script per page.** The injection fallback can race the manifest's own `document_idle` injection, and reloading the extension leaves an orphaned copy behind. On start, `ui.js` dispatches a cancelable `job-tracker-ext:hello` event on `document`. Every running copy listens for it: a live copy cancels it, which tells the newcomer to stop, and an orphaned copy (`chrome.runtime.id` is gone) tears itself down. Only then does the newcomer remove any leftover host element and mount.
 
 ### Settings (`chrome.storage.sync`)
 
@@ -297,7 +303,7 @@ Always `ContentService` JSON with HTTP 200. Writes are only accepted through POS
 
 | Code | Raised by | Meaning | Friendly message in panel/options |
 |---|---|---|---|
-| `NOT_CONFIGURED` | Service worker | No Web App URL saved | "Add your Web App URL in Settings first." (with a link to options) |
+| `NOT_CONFIGURED` | Service worker | No Web App URL saved, or the saved one is not a `https://script.google.com/macros/s/…/exec` (or `/a/macros/<domain>/s/…/exec`) URL. The token is never sent anywhere else | "Add your Web App URL in Settings first." (with a link to options) |
 | `NOT_PUBLIC` | Service worker | The response was a Google sign-in page, or the request was redirected away from the script hosts (see below) | "Google returned a sign-in page. Redeploy the Web App with *Who has access: Anyone*." |
 | `NETWORK` | Service worker | fetch failed or the 20 s timeout was reached (`AbortSignal.timeout`) | "Couldn't reach Google. Check your connection and try again." |
 | `BAD_RESPONSE` | Service worker | The body is not valid JSON in the expected shape | "Unexpected reply from the Web App. Is the URL the `/exec` link?" |
@@ -320,6 +326,8 @@ A deployment that is not shared with *Anyone* redirects to `accounts.google.com`
   - `AUTO_GHOST = true`. Turns the daily auto-ghost trigger on or off.
   - `GHOST_AFTER_DAYS = 30`. Days without change before a row is ghosted.
   - Internal names such as `SHEET_NAME = 'Applications'` and `SUMMARY_NAME = 'Summary'` sit below the settings block.
+- **Duplicate lookup.** `check` reads only the Job Link column (one narrow `getValues`), scans it from the bottom and reads the single matching row for its date and status. Workday locale prefixes (`/en-us/`) are also ignored when comparing.
+- **Applied Date.** Accepted only as a real `YYYY-MM-DD` calendar date; anything else becomes today in the spreadsheet's time zone.
 - **Locking.** `add` and `markGhosted` run inside `LockService.getScriptLock().tryLock(10000)` and release it in a `finally` block.
 - **Formula-injection guard.** Before writing, any string cell that starts with `=`, `+`, `-`, `@`, tab or CR is prefixed with `'`. This applies to every field, including Notes.
 - **Server re-validation.** Company or Role must be present. `url` must parse as http(s). `status` and `workMode` are coerced to allowed values, with defaults `Applied` and `N/A`. Field lengths are capped at 5,000 characters, well under the 50,000-character limit for a cell.
@@ -329,7 +337,7 @@ A deployment that is not shared with *Anyone* redirects to `accounts.google.com`
   - Re-applies data validation and replaces only its own status color rules (rules on other columns are kept).
   - Creates the filter, or re-creates it over all rows if it is too short, keeping any active column criteria.
   - Clears and rebuilds the `Summary` tab.
-  - Deletes every project trigger for `markGhosted` and re-creates the daily one (06:00 in the script time zone) if `AUTO_GHOST` is true.
+  - Deletes every project trigger for `markGhosted` and re-creates the daily one (06:00 in the spreadsheet's time zone, via `inTimezone`) if `AUTO_GHOST` is true.
 - **Menu.** `onOpen()` adds a **Job Tracker** menu with **Run setup** and **Mark ghosted now**.
 
 ---
@@ -345,6 +353,8 @@ For every field, the extractor tries three layers in order and takes the **first
    2. Semantic structure (`h1`, `[role=heading]`)
    3. Substring class matches for hashed CSS-module classes, such as `[class*="jd-header-title"]`
    4. Full class names, used last
+
+   Location selectors on Naukri and Workday use `pickPlaces`, which joins several links or list items inside the match with `; ` (`Pune; Mumbai; Bengaluru`), so multi-city postings don't run together.
 
    Readers exist for LinkedIn, Naukri, Indeed, Glassdoor, Greenhouse, Lever, Workday (`myworkdayjobs.com`, `myworkdaysite.com`) and Ashby. Readers also derive a `companyFallback` from the URL where the platform encodes it: the Greenhouse/Lever/Ashby path slug and the Workday tenant. A slug like `acmerobotics` is a poor display name, so the fallback is used only after the JSON-LD company: the order for Company is site reader → JSON-LD → URL fallback → generic.
 2. **schema.org `JobPosting` JSON-LD.** See below.
@@ -369,12 +379,12 @@ These are starting points. The fixtures pin them, and when a site changes its DO
 
 ### JSON-LD layer
 
-- Read every `script[type="application/ld+json"]`. Parse with `JSON.parse`. If that fails, strip control characters (`[\u0000-\u001F]` other than inside valid escapes) and raw newlines inside strings, then retry once. Ignore the block if it still fails.
+- Read every `script[type="application/ld+json"]`. Parse with `JSON.parse`. If that fails, strip HTML-comment and CDATA wrappers, replace raw control characters (such as newlines inside strings) with spaces and drop trailing commas, then retry once. Ignore the block if it still fails.
 - Flatten top-level arrays, `@graph` and `mainEntity`, and match objects whose `@type` is or includes `JobPosting`.
 - Mapping:
   - `title` → role
   - `hiringOrganization.name` (or a string) → company
-  - `jobLocation[].address` → `addressLocality, addressRegion, addressCountry` → location
+  - `jobLocation[].address` → `addressLocality, addressRegion, addressCountry` → location. Several locations are joined with `; `
   - `jobLocationType === "TELECOMMUTE"` → Remote. `applicantLocationRequirements` names are added to the location ("Remote – India").
   - `baseSalary` / `estimatedSalary` → salary (see below)
   - `experienceRequirements.monthsOfExperience` → `⌊m/12⌋+ yrs`. Text or `description` → YOE parser
@@ -437,6 +447,8 @@ Within a layer, **Hybrid > Remote > On-site**. If nothing matches, the result is
 
 - LinkedIn: `/jobs/view/<slug>-<id>`, `/jobs/view/<id>` and any page with `currentJobId=<id>` become `https://www.linkedin.com/jobs/view/<id>`.
 - Indeed: `jk` or `vjk` becomes `https://<same host>/viewjob?jk=<id>`. The host is kept because Indeed uses a country domain.
+- Workday: the locale prefix (`/en-US/`, `/de-DE/`, …) is removed, because the same job is served under every locale.
+- Naukri, Workday, Lever, Ashby and Greenhouse job-board pages (`/jobs/<id>`): the whole query string is dropped, because the path identifies the job and the query only holds search or session state (Naukri's `sid` changes on every search).
 - Everywhere:
   - Lower-case the host, drop the default port and drop the `#hash`.
   - Remove tracking parameters: `utm_*`, `ref`, `refId`, `ref_src`, `referrer`, `trk`, `trkInfo`, `trackingId`, `gh_src`, `lever-source`, `lever-origin`, `fbclid`, `gclid`, `dclid`, `msclkid`, `yclid`, `mc_cid`, `mc_eid`, `_hsenc`, `_hsmi` and `igshid`.
@@ -468,7 +480,8 @@ A page counts as a job page if any of these is true:
 
 - A site reader's `isJobPage` is true, for example LinkedIn `/jobs/view/` or `currentJobId`, Indeed `jk`/`vjk`, or a Workday `/job/` path.
 - JSON-LD contains a `JobPosting`.
-- **Generic** (only for hosts without a site reader): the URL path or query matches `job|career|position|opening|vacanc|requisition|posting`, an `h1` exists, and the page text contains at least two of `responsibilit`, `requirement`, `qualification`, `experience` and `apply`.
+- The URL has a `gh_jid=<number>` parameter: a Greenhouse board embedded on a company site. The job itself is inside Greenhouse's cross-origin iframe, so only the page title, company and link can be read; Role is often left for the user to fill in.
+- **Generic** (only for hosts without a site reader): the URL path or query matches `job|career|position|opening|vacanc|requisition|posting`, a heading (`h1`, `h2` or `[role=heading]`) exists, and the page text contains at least two of `responsibilit`, `requirement`, `qualification`, `experience` and `apply`.
 
 For hosts with a site reader, the reader's answer is final. LinkedIn's feed, for example, is never treated as a job page by the generic rule.
 
@@ -476,7 +489,8 @@ Detection is cheap: no description parsing and no regex over the full body unles
 
 ### Single-page apps (LinkedIn, Workday, Indeed)
 
-- One `MutationObserver` on `document.documentElement` (`childList`, `subtree`), plus `popstate` and `hashchange`, schedules detection. It is debounced to 500 ms but never postponed by more than 2 s, so pages that mutate constantly still get checked. When it fires, detection is skipped if the URL hasn't changed and the page is already known to be a job page; otherwise only `isLikelyJobPage` runs. The same check re-attaches the UI host if a SPA wiped it from the DOM.
+- One `MutationObserver` on `document.documentElement` (`childList`, `subtree`), plus `popstate` and `hashchange`, schedules detection. It is debounced to 500 ms but never postponed by more than 2 s, so pages that mutate constantly still get checked. The same check re-attaches the UI host if a SPA wiped it from the DOM.
+- Detection is budgeted. It runs only in `auto` mode on a site that isn't hidden (`always` and `never` need no detection). A URL already known to be a job page is not checked again, and any one URL is checked at most 10 times, which covers a slow SPA rendering its content; a new URL resets the budget. The first check waits until the settings have loaded.
 - If the extension is reloaded, the old content script is orphaned (`chrome.runtime.id` becomes undefined). It notices on its next check and removes itself. A freshly injected copy also removes any leftover host element by id.
 - **Full extraction runs on every panel open, with no caching.** This means the panel never shows data from the previously viewed job. The stale JSON-LD guard above covers frameworks that leave old `<script type="application/ld+json">` tags in the DOM.
 
@@ -487,12 +501,14 @@ Detection is cheap: no description parsing and no regex over the full body unles
 - The panel holds `Company`, `Role`, `Applied Date` (`<input type=date>`), `Status` (`<select>` with a colored dot that matches the sheet colors), `Work Mode` (`<select>`), `Location`, `YOE`, `Salary / CTC`, `Source` (`<input>` with a `<datalist>` of known sources plus Referral / Recruiter / Email), `Job Link` and `Notes` (`<textarea>`).
 - The template is a static string. Every extracted value is written with `.value` or `.textContent`, never `innerHTML`.
 - Changing the Job Link canonicalizes it and re-runs the duplicate check.
-- Light and dark themes use `@media (prefers-color-scheme: dark)` inside the shadow CSS.
-- Keyboard isolation: events from inside a closed shadow root are retargeted to the host element. A capture-phase listener on `window` calls `stopImmediatePropagation` on `keydown`, `keyup` and `keypress` whose target is the host, so the site's document and element listeners never see them. Typing still works because default actions are not cancelled. The same listener closes the panel on **Esc**. `input`, `beforeinput`, `paste`, `copy` and `cut` are also stopped at the host. Window capture listeners that the page registered *before* ours still run first. That is a platform limit, listed in the QA checklist.
+- Light and dark themes use `@media (prefers-color-scheme: dark)` inside the shadow CSS. Field borders use a separate token with at least 3:1 contrast against the field and panel backgrounds; text meets 4.5:1.
+- The panel spans the viewport height minus 12 px margins, and only the form body scrolls, so it works down to a 320 px tall viewport. The host sits at the end of `<html>` with the maximum `z-index`, so fixed headers and high-`z-index` overlays stay below it. Native modal `<dialog>`s and popovers live in the browser's top layer and can still cover it.
+- Focus: opening the panel moves focus to Company; closing it (Esc, ×, Cancel, Done) returns focus to the element that had it before, usually the floating tab.
+- Keyboard and focus isolation: events from inside a closed shadow root are retargeted to the host element. A capture-phase listener on `window` calls `stopImmediatePropagation` on `keydown`, `keyup`, `keypress`, `focusin` and `focusout` whose target is the host, so the site's document and element listeners (shortcuts, focus traps) never see them. Typing still works because default actions are not cancelled. The same listener closes the panel on **Esc**. `input`, `beforeinput`, `paste`, `copy` and `cut` are also stopped at the host. Window capture listeners that the page registered *before* ours still run first. That is a platform limit, listed in the QA checklist.
 - States:
   - Idle
   - Duplicate warning: a banner reading "Already saved on <date>, status <X>". Saving is still allowed.
-  - Saving: the button is disabled and shows a spinner.
+  - Saving: the button is disabled and shows a spinner. A reply that arrives after the panel was closed or reopened is ignored.
   - Success: "Saved to row N" with an **Open sheet** link to `sheetUrl`.
   - Error: the friendly message from the table in §6.
 - Validation runs before sending: Company or Role is required, and Job Link must parse as an `http(s)` URL. Inline errors are shown on the fields.
@@ -514,6 +530,8 @@ Detection is cheap: no description parsing and no regex over the full body unles
   - It is stored in `chrome.storage.sync`, which syncs with the user's browser profile.
   - It appears in GET query strings, which Google may log.
   - Users should treat it as a low-value secret and pick a fresh random string.
+  - The service worker only sends it to a URL matching the Web App `/exec` shape (the same regex as the options page), so a mistyped or tampered setting can't leak it to another host.
+  - Without a secret, anyone with the URL can also call `ping` (spreadsheet name and row count) and `check` (whether a link is saved).
 - **Web App access "Anyone".** This is required because the extension calls it without Google cookies. The script runs as the sheet owner and only ever appends rows or reads the Job Link column.
 - **Input limits.** The server caps field lengths and coerces enums, so a hostile page can't push huge or invalid values through extracted fields.
 - **Test fixtures are synthetic.** They are minimal hand-written HTML that mimics each site's structure. No real job posts or personal data are committed.
@@ -531,6 +549,8 @@ Detection is cheap: no description parsing and no regex over the full body unles
   - `canonicalUrl`: LinkedIn view/slug/`currentJobId`, Indeed `jk`/`vjk`, tracking-parameter removal, `gh_jid` kept, `/apply` and trailing slash removed.
   - `sourceFromHost`: every mapped host plus the Company Site fallback.
 - **Fixture tests (`extract.test.js`):** a table of `{ fixture, url, expected }` covering LinkedIn (including a search page with `currentJobId` and stale JSON-LD), Naukri, Indeed, Glassdoor, Greenhouse, Lever, Workday, Ashby, a **JSON-LD-only** page (malformed JSON inside `@graph`) and a **plain career page** that relies on heuristics only. Each test checks every field and `isLikelyJobPage`. A blog post fixture and LinkedIn's feed URL check that detection stays quiet on non-job pages.
+  - Edge-case fixtures: Naukri with a `3-5 Yrs` chip, salary "Not disclosed", several location links, "remote teams" and "Founded 10 years ago" (`naukri-edge`); a Lever job in "Remote (India)" with the YOE in words (`lever-remote`); a Greenhouse embed on a company domain (`greenhouse-embed`); a page with no `h1` and Hybrid only in the description (`no-h1`); a Workday `/de-DE/` page with two locations (`workday-multi`); JSON-LD inside a comment with raw newlines, trailing commas and two locations next to an unrecoverable block (`jsonld-malformed`).
+  - LinkedIn search and collection pages with `currentJobId`, and a ~1.2 MB description that must stay fast and respect the 50,000-character parsing cap.
 - **Apps Script tests (`apps-script.test.js`):** `Code.gs` is read as text and run with `node:vm` in a context that provides small in-memory mocks of `SpreadsheetApp` (a sheet backed by a 2D array, with `getRange`/`getValues`/`setValues`/`getLastRow`/`insertRowsAfter`; formatting calls are absorbed by a chainable proxy), `LockService`, `ContentService`, `ScriptApp` and `Utilities`. `Code.gs` contains no Node-specific code. The tests cover:
   - Each `doGet`/`doPost` action and error code
   - The token check, both enabled and disabled
@@ -539,19 +559,14 @@ Detection is cheap: no description parsing and no regex over the full body unles
   - `markGhosted` thresholds and `AUTO_GHOST = false`
   - Row top-up when the pre-formatted rows run out
   - Duplicate lookup by normalized link
-  - `setup()` idempotency: running it twice gives the same validation, rules and trigger count
+  - `setup()` idempotency: running it twice gives the same tabs, validation, rules and trigger count, and keeps the user's own rules
+  - Summary formulas wrapped for an empty sheet, the trigger's time zone, a 2,500-row duplicate lookup, Workday locale matching and rows without dates in `markGhosted`
 - **Sync test:** status colors and tracking parameters are duplicated across `Code.gs` (which can't import anything), `ui.js` and `extract.js`. A test compares the literal blocks so they can't drift apart.
-- **UI and options page:** checked by hand (see the checklist below). They are thin wiring over the tested modules.
-- **Manual QA checklist:**
-  - Load unpacked in Chrome, Edge and Brave.
-  - Save from each supported site.
-  - Navigate between jobs in the LinkedIn search list without reloading.
-  - Press Alt+Shift+J on a non-job page.
-  - Hide a site and restore it from options.
-  - Check light and dark mode.
-  - Check each friendly error: no URL, deploy access not set to Anyone, wrong secret, offline, setup not run.
-  - Run the duplicate warning flow.
-  - Type in the panel on LinkedIn without triggering site shortcuts.
+- **UI tests (`ui.test.js`):** `ui.js` runs in jsdom with a `chrome.*` mock; the closed shadow root is captured by wrapping `attachShadow`. They cover the open/duplicate/validate/save flow, error banners, the Google-Sheets-only link, Esc, key and focus isolation, focus return, late save replies, hiding a site, the single-instance handshake, and the detection budget per mode and URL.
+- **Options tests (`options.test.js`):** label association, loading settings, `/exec` URL validation, save-on-successful-test, the not-set-up warning, button mode and hidden sites.
+- **Service worker tests (`background.test.js`):** `background.js` runs in `node:vm` with `chrome.*` and `fetch` mocks. They check that the token goes only to a valid `/exec` URL (query for GET, body for POST), every reply-to-error mapping including `NOT_PUBLIC` detection, unknown messages, the options-page and badge fallbacks of the toolbar click, and that the URL regex matches the options page.
+- **Contract test:** every error code `Code.gs` can return must have a message in `background.js` and a row in the table in §6.
+- **Manual QA:** layout, real sites, real Google deployments and browser-specific behavior can't be faked well. [TESTING.md](TESTING.md) is the checklist to run before a release.
 
 ---
 
