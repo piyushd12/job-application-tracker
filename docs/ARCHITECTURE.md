@@ -56,7 +56,7 @@ sequenceDiagram
     autonumber
     actor U as User
     participant P as Job page
-    participant CS as Content script<br/>(extract.js, sites.js, content.js)
+    participant CS as Content script<br/>(extract.js, ui.js)
     participant SW as Service worker<br/>(background.js)
     participant AS as Apps Script Web App<br/>(Code.gs)
     participant S as Google Sheet
@@ -98,7 +98,7 @@ The service worker makes every network call. Content scripts run under the page'
 │   ├── background.js          # service worker: fetch, commands, action click, onInstalled
 │   ├── content/
 │   │   ├── extract.js         # pure logic: site readers, JSON-LD, heuristics, field parsers, canonicalUrl, source map
-│   │   └── content.js         # Shadow DOM button + panel, SPA watcher, messaging
+│   │   └── ui.js              # Shadow DOM button + panel, SPA watcher, messaging
 │   ├── options/
 │   │   ├── options.html
 │   │   └── options.js
@@ -305,6 +305,7 @@ Always `ContentService` JSON with HTTP 200. Writes are only accepted through POS
 | `SETUP_REQUIRED` | Apps Script | The `Applications` tab or its header is missing | "Sheet isn't set up. In the sheet: Job Tracker → Run setup." |
 | `LOCK_TIMEOUT` | Apps Script | `LockService` could not get the lock within 10 s | "The sheet is busy. Try again in a moment." |
 | `INTERNAL` | Apps Script | Any other exception (the message is logged, not returned) | "Something went wrong in the script. Check Executions in Apps Script." |
+| `RELOADED` | Content script | The extension was reloaded or updated, so this page's content script can no longer reach the service worker | "The extension was updated. Reload this page and try again." |
 
 ### Detecting a Web App that isn't public
 
@@ -473,15 +474,19 @@ Detection is cheap: no description parsing and no regex over the full body unles
 
 ### Single-page apps (LinkedIn, Workday, Indeed)
 
-- One `MutationObserver` on `document.body` (`childList`, `subtree`) is debounced to 500 ms. When it fires, it compares `location.href` with the last value, listens for `popstate` too, and re-runs detection only. Detection is fast, so this stays cheap on busy feeds.
+- One `MutationObserver` on `document.documentElement` (`childList`, `subtree`), plus `popstate` and `hashchange`, schedules detection. It is debounced to 500 ms but never postponed by more than 2 s, so pages that mutate constantly still get checked. When it fires, detection is skipped if the URL hasn't changed and the page is already known to be a job page; otherwise only `isLikelyJobPage` runs. The same check re-attaches the UI host if a SPA wiped it from the DOM.
+- If the extension is reloaded, the old content script is orphaned (`chrome.runtime.id` becomes undefined). It notices on its next check and removes itself. A freshly injected copy also removes any leftover host element by id.
 - **Full extraction runs on every panel open, with no caching.** This means the panel never shows data from the previously viewed job. The stale JSON-LD guard above covers frameworks that leave old `<script type="application/ld+json">` tags in the DOM.
 
 ### Panel UI
 
 - The host element is a `<div>` appended to `documentElement` with `all: initial`. Its shadow root is **closed**, and its styles live inside the shadow root, so page CSS can't leak in.
-- The panel holds `Company`, `Role`, `Applied Date` (`<input type=date>`), `Status` and `Work Mode` (`<select>`), `Location`, `YOE`, `Salary`, `Source`, `Job Link` and `Notes` (`<textarea>`).
+- The floating tab sits on the right edge. Its "Save job" label slides out on hover or focus, and a small **×** on its corner hides it for the current hostname.
+- The panel holds `Company`, `Role`, `Applied Date` (`<input type=date>`), `Status` (`<select>` with a colored dot that matches the sheet colors), `Work Mode` (`<select>`), `Location`, `YOE`, `Salary / CTC`, `Source` (`<input>` with a `<datalist>` of known sources plus Referral / Recruiter / Email), `Job Link` and `Notes` (`<textarea>`).
+- The template is a static string. Every extracted value is written with `.value` or `.textContent`, never `innerHTML`.
+- Changing the Job Link canonicalizes it and re-runs the duplicate check.
 - Light and dark themes use `@media (prefers-color-scheme: dark)` inside the shadow CSS.
-- Keyboard isolation: `keydown`, `keyup`, `keypress` and `input` events are stopped with `stopPropagation` at the shadow host, which blocks the bubble-phase listeners most sites use for shortcuts. A window capture listener also calls `stopImmediatePropagation` for events whose `composedPath()[0]` is inside the panel. Page capture listeners registered *before* ours still run first. That is a platform limit, documented in the QA checklist.
+- Keyboard isolation: events from inside a closed shadow root are retargeted to the host element. A capture-phase listener on `window` calls `stopImmediatePropagation` on `keydown`, `keyup` and `keypress` whose target is the host, so the site's document and element listeners never see them. Typing still works because default actions are not cancelled. The same listener closes the panel on **Esc**. `input`, `beforeinput`, `paste`, `copy` and `cut` are also stopped at the host. Window capture listeners that the page registered *before* ours still run first. That is a platform limit, listed in the QA checklist.
 - States:
   - Idle
   - Duplicate warning: a banner reading "Already saved on <date>, status <X>". Saving is still allowed.
