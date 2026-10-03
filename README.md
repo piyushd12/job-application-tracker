@@ -1,0 +1,3 @@
+# Job Application Tracker
+
+A Chrome extension (Manifest V3) that saves the job you just applied to into your own Google Sheet with one click. On a job posting page it shows a small tab on the right edge of the screen. Clicking the tab opens a side panel with the company, role, location, work mode, years of experience, salary, source and link already filled in from the page. You can edit any field, then click Save, and a Google Apps Script web app in your own sheet adds the row. The extension uses no AI or LLM APIs, has no analytics and contacts no third-party servers. This project is in early development. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design and roadmap.

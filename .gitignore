@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Secrets and local config
+.env
+.env.*
+*.pem
+.clasprc.json
+
+# Build / packaging output
+*.zip
+*.crx
+coverage/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*~
