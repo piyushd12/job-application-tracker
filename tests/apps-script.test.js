@@ -112,7 +112,7 @@ function makeEnv({ secret = '', autoGhost = true } = {}) {
   const ss = absorb({
     getName: () => 'My Job Hunt',
     getUrl: () => 'https://docs.google.com/spreadsheets/d/abc/edit',
-    getSpreadsheetTimeZone: () => 'UTC',
+    getSpreadsheetTimeZone: () => 'Asia/Kolkata',
     getSheetByName: (name) => sheets.find((s) => s.name === name) || null,
     insertSheet: (name) => {
       const sheet = absorb(new MockSheet(name));
@@ -121,8 +121,11 @@ function makeEnv({ secret = '', autoGhost = true } = {}) {
     },
   });
   const triggerBuilder = (name) => {
+    const calls = {};
     const proxy = new Proxy({}, {
-      get: (_, prop) => (prop === 'create' ? () => triggers.push({ getHandlerFunction: () => name }) : () => proxy),
+      get: (_, prop) => (prop === 'create'
+        ? () => triggers.push({ getHandlerFunction: () => name, calls })
+        : (...args) => { calls[prop] = args; return proxy; }),
     });
     return proxy;
   };
@@ -162,6 +165,7 @@ function makeEnv({ secret = '', autoGhost = true } = {}) {
   return {
     ctx,
     triggers,
+    sheets,
     sheet: () => ss.getSheetByName('Applications'),
     summary: () => ss.getSheetByName('Summary'),
     get: (params) => JSON.parse(ctx.doGet({ parameter: params }).text),
@@ -214,7 +218,31 @@ test('setup builds the sheet and is idempotent', () => {
   assert.equal(sheet.rules.length, 8);
   assert.equal(env.triggers.length, 1);
   assert.equal(sheet.filtersCreated, 1);
+  assert.deepEqual(env.sheets.map((s) => s.name), ['Applications', 'Summary'], 'no duplicate tabs');
   assert.equal(env.get({ action: 'ping' }).setup, true);
+});
+
+test('setup keeps rules on other columns and the daily trigger runs in the sheet time zone', () => {
+  const env = makeEnv();
+  env.ctx.setup();
+  const sheet = env.sheet();
+  const userRule = { getRanges: () => [sheet.getRange(2, 6, 10, 1)] };
+  sheet.rules.push(userRule);
+  env.ctx.setup();
+  assert.equal(sheet.rules.length, 9);
+  assert.ok(sheet.rules.includes(userRule));
+  assert.deepEqual(env.triggers[0].calls.atHour, [6]);
+  assert.deepEqual(env.triggers[0].calls.inTimezone, ['Asia/Kolkata']);
+});
+
+test('Summary formulas tolerate an empty sheet', () => {
+  const env = makeEnv();
+  env.ctx.setup();
+  const summary = env.summary();
+  assert.match(String(summary.cell(5, 2)), /^=IFERROR\(/, 'response rate');
+  assert.match(String(summary.cell(6, 2)), /^=IFERROR\(/, 'interview rate');
+  for (let r = 2; r <= 9; r++) assert.match(String(summary.cell(r, 6)), /^=IFERROR\(/, 'status share');
+  assert.match(String(summary.cell(2, 8)), /^=IFERROR\(QUERY\(/, 'source breakdown');
 });
 
 test('setup skips the daily trigger when AUTO_GHOST is off', () => {
@@ -242,6 +270,13 @@ test('add appends a sanitized row and returns its number', () => {
   assert.equal(row[11], "'+1 referral");
   assert.equal(env.post({ action: 'add', job: JOB }).row, 3);
   assert.equal(env.get({ action: 'ping' }).rows, 2);
+});
+
+test('add falls back to today for a malformed applied date', () => {
+  const env = makeEnv();
+  env.ctx.setup();
+  env.post({ action: 'add', job: { ...JOB, appliedDate: '2026-13-45' } });
+  assert.equal(env.sheet().cell(2, 3), new Date().toISOString().slice(0, 10));
 });
 
 test('add validates company/role and link', () => {
@@ -274,6 +309,34 @@ test('check finds duplicates by normalized link', () => {
   });
   assert.deepEqual(env.get({ action: 'check', url: 'https://careers.acme.com/jobs/43' }), { ok: true, found: false });
   assert.equal(env.get({ action: 'check' }).error, 'BAD_REQUEST');
+});
+
+test('check ignores the Workday locale segment', () => {
+  const env = makeEnv();
+  env.ctx.setup();
+  env.post({ action: 'add', job: { ...JOB, url: 'https://acme.wd5.myworkdayjobs.com/en-US/External/job/Pune/QA_R-1' } });
+  assert.equal(env.get({ action: 'check', url: 'https://acme.wd5.myworkdayjobs.com/External/job/Pune/QA_R-1' }).found, true);
+  assert.equal(env.get({ action: 'check', url: 'https://acme.wd5.myworkdayjobs.com/de-DE/External/job/Pune/QA_R-1' }).found, true);
+});
+
+test('check scales to thousands of rows and reports the newest match', () => {
+  const env = makeEnv();
+  env.ctx.setup();
+  const sheet = env.sheet();
+  const rows = 2500;
+  sheet.insertRowsAfter(sheet.getMaxRows(), rows);
+  for (let r = 2; r <= rows + 1; r++) {
+    sheet.cells[r - 1].splice(0, 12, 'Acme', 'Role', '2026-01-01', 'Applied', 'N/A', '', 'N/A', '', 'LinkedIn', `https://acme.com/jobs/${r}`, '', '');
+  }
+  sheet.cells[rows][9] = 'https://acme.com/jobs/2'; // a second, newer copy of row 2's link
+  sheet.cells[rows][3] = 'Interview';
+
+  const started = Date.now();
+  assert.deepEqual(env.get({ action: 'check', url: 'https://acme.com/jobs/2?utm_source=x' }), {
+    ok: true, found: true, row: rows + 1, appliedDate: '2026-01-01', status: 'Interview',
+  });
+  assert.equal(env.get({ action: 'check', url: 'https://acme.com/jobs/999999' }).found, false);
+  assert.ok(Date.now() - started < 1000, 'fast enough');
 });
 
 test('secret token is enforced only when set', () => {
@@ -324,6 +387,16 @@ test('markGhosted ghosts stale Applied/OA rows only', () => {
   assert.equal(env.ctx.markGhosted(), 0);
 });
 
+test('markGhosted skips rows without a usable date', () => {
+  const env = makeEnv();
+  env.ctx.setup();
+  const sheet = env.sheet();
+  sheet.cells[1].splice(0, 12, 'Manual', 'Typed row', '', 'Applied', 'N/A', '', 'N/A', '', '', 'https://a.com/1', '', '');
+  sheet.cells[2].splice(0, 12, 'Manual', 'Typed row', 'soon', 'Applied', 'N/A', '', 'N/A', '', '', 'https://a.com/2', 'n/a', '');
+  assert.equal(env.ctx.markGhosted(), 0);
+  assert.deepEqual([sheet.cell(2, STATUS), sheet.cell(3, STATUS)], ['Applied', 'Applied']);
+});
+
 test('markGhosted does nothing when AUTO_GHOST is off', () => {
   const env = makeEnv({ autoGhost: false });
   env.ctx.setup();
@@ -331,6 +404,18 @@ test('markGhosted does nothing when AUTO_GHOST is off', () => {
   env.sheet().cells[1][UPDATED - 1] = new Date(Date.now() - 90 * DAY_MS);
   assert.equal(env.ctx.markGhosted(), 0);
   assert.equal(env.sheet().cell(2, STATUS), 'Applied');
+});
+
+test('every server error code has a client message and is documented', () => {
+  const read = (file) => fs.readFileSync(path.join(__dirname, '..', file), 'utf8');
+  const background = read('extension/background.js');
+  const docs = read('docs/ARCHITECTURE.md');
+  const codes = [...new Set([...CODE.matchAll(/fail_\('([A-Z_]+)'/g)].map((m) => m[1]))];
+  assert.deepEqual(codes.sort(), ['BAD_REQUEST', 'BAD_TOKEN', 'INTERNAL', 'LOCK_TIMEOUT', 'SETUP_REQUIRED', 'UNKNOWN_ACTION']);
+  for (const code of codes) {
+    assert.match(background, new RegExp(`\\b${code}: ['"]`), `${code} message in background.js`);
+    assert.match(docs, new RegExp(`\\| \`${code}\` \\| Apps Script`), `${code} in ARCHITECTURE.md`);
+  }
 });
 
 test('Code.gs and the extension agree on status colors and tracking parameters', () => {

@@ -126,7 +126,7 @@ function addJob_(job) {
   }
 }
 
-// ponytail: linear scan of the link column; fine for thousands of rows, switch to a link index if sheets grow far beyond that.
+// ponytail: linear scan of the link column only (one narrow read); fine for tens of thousands of rows.
 function checkDuplicate_(url) {
   const target = normalizeLink_(url);
   if (!target) return fail_('BAD_REQUEST', 'Missing url.');
@@ -135,15 +135,16 @@ function checkDuplicate_(url) {
 
   const lastRow = sheet.getLastRow();
   if (lastRow < 2) return { ok: true, found: false };
-  const rows = sheet.getRange(2, 1, lastRow - 1, HEADERS.length).getValues();
-  for (let i = rows.length - 1; i >= 0; i--) {
-    if (normalizeLink_(rows[i][COL.link - 1]) !== target) continue;
+  const links = sheet.getRange(2, COL.link, lastRow - 1, 1).getValues();
+  for (let i = links.length - 1; i >= 0; i--) {
+    if (normalizeLink_(links[i][0]) !== target) continue;
+    const row = sheet.getRange(i + 2, 1, 1, HEADERS.length).getValues()[0];
     return {
       ok: true,
       found: true,
       row: i + 2,
-      appliedDate: formatDate_(rows[i][COL.applied - 1]),
-      status: text_(rows[i][COL.status - 1]) || 'N/A',
+      appliedDate: formatDate_(row[COL.applied - 1]),
+      status: text_(row[COL.status - 1]) || 'N/A',
     };
   }
   return { ok: true, found: false };
@@ -193,7 +194,7 @@ function safeText_(value) {
 /** An ISO date string is parsed by Sheets in the spreadsheet's own time zone, so the day never shifts. */
 function appliedDate_(value) {
   const s = text_(value);
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  if (/^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$/.test(s)) return s;
   return Utilities.formatDate(new Date(), timeZone_(), 'yyyy-MM-dd');
 }
 
@@ -202,10 +203,11 @@ function oneOf_(value, allowed, fallback) {
   return allowed.indexOf(s) === -1 ? fallback : s;
 }
 
-/** Lower-cased link without scheme, www, hash, tracking parameters, /apply or trailing slash. */
+/** Lower-cased link without scheme, www, hash, Workday locale, tracking parameters, /apply or trailing slash. */
 function normalizeLink_(value) {
   let s = text_(value).replace(/^'/, '').toLowerCase();
-  s = s.replace(/#.*$/, '').replace(/^https?:\/\//, '').replace(/^www\./, '');
+  s = s.replace(/#.*$/, '').replace(/^https?:\/\//, '').replace(/^www\./, '')
+    .replace(/^([^/]*\.myworkday(?:jobs|site)\.com)\/[a-z]{2}-[a-z]{2}(?=\/)/, '$1');
   if (!s) return '';
   const q = s.indexOf('?');
   const path = (q === -1 ? s : s.slice(0, q)).replace(/\/apply\/?$/, '').replace(/\/+$/, '');
@@ -418,7 +420,8 @@ function buildSummary_(ss) {
   });
 
   sheet.getRange(1, 8, 1, 2).setValues([['Source', 'Count']]);
-  sheet.getRange(2, 8).setFormula('=QUERY(' + all + ",\"select I, count(I) where I <> '' group by I order by count(I) desc label I '', count(I) ''\",0)");
+  // IFERROR: QUERY returns #N/A on a sheet with no rows yet.
+  sheet.getRange(2, 8).setFormula('=IFERROR(QUERY(' + all + ",\"select I, count(I) where I <> '' group by I order by count(I) desc label I '', count(I) ''\",0),\"\")");
 
   [[1, 2], [4, 3], [8, 2]].forEach(function (block) {
     sheet.getRange(1, block[0], 1, block[1]).setFontWeight('bold').setBackground('#1f2937').setFontColor('#ffffff');
@@ -431,7 +434,7 @@ function installTriggers_() {
   ScriptApp.getProjectTriggers().forEach(function (trigger) {
     if (trigger.getHandlerFunction() === 'markGhosted') ScriptApp.deleteTrigger(trigger);
   });
-  if (AUTO_GHOST) ScriptApp.newTrigger('markGhosted').timeBased().everyDays(1).atHour(6).create();
+  if (AUTO_GHOST) ScriptApp.newTrigger('markGhosted').timeBased().everyDays(1).atHour(6).inTimezone(timeZone_()).create();
 }
 
 // ===== Helpers =============================================================
