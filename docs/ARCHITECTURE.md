@@ -34,7 +34,7 @@ This document describes the design of **Job Application Tracker**. It is a Manif
 |---|---|---|
 | Content scripts | Every http/https page (isolated world) | Detect job pages, extract fields, render the button and panel in Shadow DOM |
 | Service worker | Extension background | Every network call to the Web App, toolbar/shortcut handling, first-run options page |
-| Options page | Extension page | Web App URL, secret, test connection, button mode, hidden sites |
+| Options page | Extension page | Web App URL, secret, test connection (shows the spreadsheet name and saved-job count, and saves the settings when it succeeds), button mode, hidden sites, current shortcut |
 | Apps Script Web App | Google, bound to the user's sheet | Validate, deduplicate, append rows, sheet setup, triggers |
 | Google Sheet | User's Drive | The data. The Summary tab is built from formulas only |
 

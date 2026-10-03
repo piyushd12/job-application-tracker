@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Job Application Tracker – Settings</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f5f7fa; --card: #ffffff; --fg: #1f2328; --muted: #5f6670; --border: #d6dae0; --field: #ffffff;
+      --accent: #2563eb; --accent-fg: #ffffff; --ok: #0d652d; --ok-bg: #e6f4ea; --danger: #b42318; --danger-bg: #fef3f2;
+      --warn: #7a4d00; --warn-bg: #fff4dc;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #14171c; --card: #1d2127; --fg: #e6e8eb; --muted: #9aa3ad; --border: #3a414a; --field: #262b33;
+        --accent: #6b9bff; --accent-fg: #0b1220; --ok: #7ee2a8; --ok-bg: #173b26; --danger: #ff9b91; --danger-bg: #3a1f1f;
+        --warn: #f6c86b; --warn-bg: #3a2f12;
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    main { max-width: 720px; margin: 0 auto; padding: 32px 16px 48px; }
+    header { display: flex; align-items: center; gap: 14px; margin-bottom: 24px; }
+    header img { width: 48px; height: 48px; }
+    h1 { margin: 0; font-size: 22px; }
+    header p { margin: 2px 0 0; color: var(--muted); }
+    section { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 20px; margin-bottom: 16px; }
+    h2 { margin: 0 0 4px; font-size: 16px; }
+    .lead { margin: 0 0 16px; color: var(--muted); font-size: 14px; }
+    .lead.tight { margin-bottom: 12px; }
+    label.field { display: block; margin-bottom: 14px; }
+    label.field > span { display: block; margin-bottom: 4px; font-size: 13px; font-weight: 600; }
+    .help { display: block; margin-top: 4px; color: var(--muted); font-size: 13px; }
+    input[type="url"], input[type="password"], input[type="text"] {
+      width: 100%; padding: 9px 11px; font: inherit; color: inherit; background: var(--field);
+      border: 1px solid var(--border); border-radius: 8px;
+    }
+    input:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+    [aria-invalid="true"] { border-color: var(--danger) !important; }
+    .secret-row { display: flex; gap: 8px; }
+    .secret-row input { flex: 1; min-width: 0; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    button { padding: 9px 16px; border-radius: 8px; font: 600 14px/1.2 inherit; cursor: pointer; }
+    button.primary { border: 0; background: var(--accent); color: var(--accent-fg); }
+    button.secondary { border: 1px solid var(--border); background: transparent; color: var(--fg); }
+    button:disabled { opacity: .6; cursor: progress; }
+    .status { margin: 14px 0 0; padding: 10px 12px; border-radius: 10px; font-size: 14px; }
+    .status.ok { background: var(--ok-bg); color: var(--ok); }
+    .status.warn { background: var(--warn-bg); color: var(--warn); }
+    .status.error { background: var(--danger-bg); color: var(--danger); }
+    fieldset { border: 0; margin: 0; padding: 0; }
+    .choice { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; margin-bottom: 8px; cursor: pointer; }
+    .choice:has(input:checked) { border-color: var(--accent); }
+    .choice input { margin-top: 4px; accent-color: var(--accent); }
+    .choice strong { display: block; font-size: 14px; }
+    .choice span { color: var(--muted); font-size: 13px; }
+    .saved-note { color: var(--ok); font-size: 13px; }
+    ul.sites { list-style: none; margin: 0; padding: 0; }
+    ul.sites li { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--border); }
+    ul.sites li:last-child { border-bottom: 0; }
+    ul.sites code { overflow-wrap: anywhere; }
+    .empty { color: var(--muted); font-size: 14px; margin: 0; }
+    kbd { padding: 2px 6px; border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 6px; font: 600 13px/1.4 ui-monospace, monospace; }
+    footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 24px; }
+    a { color: var(--accent); }
+    @media (max-width: 520px) {
+      main { padding-top: 20px; }
+      section { padding: 16px; }
+      .actions button { flex: 1; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <img src="../icons/icon128.png" alt="">
+      <div>
+        <h1>Job Application Tracker</h1>
+        <p>Save jobs to your own Google Sheet with one click.</p>
+      </div>
+    </header>
+
+    <section aria-labelledby="connect-title">
+      <h2 id="connect-title">Connect your sheet</h2>
+      <p class="lead">Deploy <code>Code.gs</code> as a Web App from your sheet, then paste its URL here. <a href="https://github.com/piyushd12/job-application-tracking-extension#installation" target="_blank" rel="noopener noreferrer">Setup guide</a></p>
+      <form id="connection-form" novalidate>
+        <label class="field">
+          <span>Web App URL</span>
+          <input id="web-app-url" type="url" placeholder="https://script.google.com/macros/s/…/exec" autocomplete="off" spellcheck="false" required>
+          <small class="help">In Apps Script: Deploy → Manage deployments → copy the Web app URL (it ends in <code>/exec</code>).</small>
+        </label>
+        <label class="field">
+          <span>Secret (optional)</span>
+          <span class="secret-row">
+            <input id="secret" type="password" autocomplete="off" spellcheck="false">
+            <button id="toggle-secret" class="secondary" type="button" aria-pressed="false">Show</button>
+          </span>
+          <small class="help">Only needed if you set <code>SECRET</code> in Code.gs. Both values must match.</small>
+        </label>
+        <div class="actions">
+          <button class="primary" type="submit">Save</button>
+          <button id="test-connection" class="secondary" type="button">Test connection</button>
+        </div>
+        <p id="connection-status" class="status" role="status" hidden></p>
+      </form>
+    </section>
+
+    <section aria-labelledby="button-title">
+      <h2 id="button-title">Floating button</h2>
+      <p class="lead">When should the "Save job" tab appear on the right edge of the page? The toolbar icon and the shortcut work everywhere, whatever you choose.</p>
+      <fieldset id="button-mode" aria-labelledby="button-title">
+        <label class="choice"><input type="radio" name="buttonMode" value="auto"><span><strong>Auto (recommended)</strong><span>Only on pages that look like a job posting.</span></span></label>
+        <label class="choice"><input type="radio" name="buttonMode" value="always"><span><strong>Always</strong><span>On every website.</span></span></label>
+        <label class="choice"><input type="radio" name="buttonMode" value="never"><span><strong>Never</strong><span>Use the toolbar icon or the shortcut instead.</span></span></label>
+      </fieldset>
+      <span id="mode-saved" class="saved-note" role="status"></span>
+    </section>
+
+    <section aria-labelledby="hidden-title">
+      <h2 id="hidden-title">Hidden sites</h2>
+      <p class="lead">Sites where you clicked × on the button. Remove a site to show the button there again.</p>
+      <ul id="hidden-sites" class="sites"></ul>
+      <p id="no-hidden-sites" class="empty">No hidden sites.</p>
+    </section>
+
+    <section aria-labelledby="shortcut-title">
+      <h2 id="shortcut-title">Keyboard shortcut</h2>
+      <p class="lead tight">Open the panel on any page with <kbd id="shortcut">Alt+Shift+J</kbd>.</p>
+      <button id="edit-shortcut" class="secondary" type="button">Change shortcut</button>
+    </section>
+
+    <footer>
+      Your data goes only to your own Google Sheet. No analytics, no tracking, no third-party servers.
+    </footer>
+  </main>
+  <script src="options.js"></script>
+</body>
+</html>
