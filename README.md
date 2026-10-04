@@ -1,6 +1,6 @@
 # Job Application Tracker
 
-**Save the job you just applied to into your own Google Sheet with one click.** A free, open-source Chrome extension with no AI, no accounts, and no servers other than your own sheet.
+**Save the job you just applied to into your own Google Sheet with one click.** A free, open-source Chrome extension with no AI and no servers: one click on **Connect Google Sheets** and every job you save goes straight from your browser into a spreadsheet in your own Google Drive.
 
 <!--
   SCREENSHOT / GIF TO CAPTURE (save it in docs/screenshots/ and replace this placeholder):
@@ -19,14 +19,15 @@ This extension reads those details from the job page for you. You check them, cl
 
 ## Features
 
+- **Zero setup.** Click **Connect Google Sheets**, approve Google's consent screen, and a fully formatted tracker sheet appears in your Drive.
 - **One-click capture.** A small tab appears on the right edge of job postings. Click it to open a side panel with every field already filled in.
 - **Works on any site.** Dedicated readers for the big job boards and ATSs, plus schema.org structured data and page heuristics for everything else.
 - **Editable before saving.** Every field can be changed. Company or role is required, and the link is checked.
 - **Duplicate warning.** If the job is already in your sheet, the panel says when you saved it and its current status. Links are compared after removing tracking parameters.
 - **A sheet that's ready to use.** Status and work-mode dropdowns, a color for each status, a filter, frozen headers and a formula-only **Summary** tab: totals, last 7 and 30 days, response rate, interview rate, offers, and counts per status and source.
-- **Automatic upkeep.** *Last Updated* refreshes whenever you change a status. Applications with no movement for 30 days are marked **Ghosted** automatically, and you can turn that off.
+- **Automatic upkeep.** Once a day, *Last Updated* is set on rows whose status you changed, and applications with no movement for 30 days are marked **Ghosted**. You can change the number of days or turn ghosting off.
 - **Keyboard friendly.** Press `Alt+Shift+J` on any page to open the panel and `Esc` to close it. Typing in the panel is kept away from the site's own keyboard shortcuts.
-- **Private by design.** Data goes only from your browser to your own Google Apps Script. No analytics, no tracking, no third-party servers.
+- **Private by design.** Data goes only from your browser to your own Google Sheet. The extension can only see the spreadsheet it created. No analytics, no tracking, no servers.
 - **Light and dark mode**, and no build step: plain JavaScript you can read.
 
 ## How it works
@@ -35,13 +36,13 @@ This extension reads those details from the job page for you. You check them, cl
 flowchart LR
     A[Job page] -->|reads fields locally| B[Content script<br/>floating tab + panel]
     B -->|you click Save| C[Extension service worker]
-    C -->|HTTPS| D[Apps Script Web App<br/>in your Google account]
+    C -->|HTTPS, your Google sign-in| D[Google Sheets API]
     D -->|appends a row| E[(Your Google Sheet)]
 ```
 
 1. The content script checks each page to see whether it looks like a job posting.
 2. When you open the panel, it extracts the fields with deterministic rules (no AI): a site-specific reader first, then schema.org `JobPosting` data, then general page heuristics.
-3. When you save, the extension's service worker sends the job to the Apps Script Web App you deployed from your own sheet. The script validates the data and appends the row.
+3. When you save, the extension's service worker appends the row to your sheet through the Google Sheets API, signed in as you. Nothing passes through any other server.
 
 The full design is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -64,7 +65,7 @@ The **Source** column is also filled automatically for SmartRecruiters, iCIMS, W
 
 ## The sheet
 
-Running `setup` creates an **Applications** tab with these columns:
+Connecting creates a spreadsheet called **Job Applications Tracker** in your Google Drive. Its **Applications** tab has these columns:
 
 | Column | What goes in it |
 |---|---|
@@ -78,7 +79,7 @@ Running `setup` creates an **Applications** tab with these columns:
 | Salary / CTC | From structured data, the site, or the description (supports `12-18 LPA`, `₹`, `$`, `€`, `£`) |
 | Source | LinkedIn, Naukri, Greenhouse, … or Company Site |
 | Job Link | Cleaned link without tracking or search parameters, so the same job always gets the same link |
-| Last Updated | Set when the row is added and whenever Status changes |
+| Last Updated | Set when the row is added, when you change Status (picked up by the daily check) and when a row is ghosted |
 | Notes | Anything you like |
 
 **Status colors**
@@ -94,45 +95,24 @@ A **Summary** tab shows total applications, applications in the last 7 and 30 da
 
 ## Installation
 
-Setup takes about five minutes. It has three parts: the sheet, the extension, and connecting the two.
+Install **Job Application Tracker** from the Chrome Web Store:
 
-### Part 1: Create your sheet and Web App
+> **[Chrome Web Store: link coming soon](https://chromewebstore.google.com/)**
+> <!-- Replace with the listing URL once the item is published. -->
 
-1. Create a new Google Sheet (open [sheets.new](https://sheets.new)) and give it a name, for example *Job Hunt*.
-2. In the sheet, open **Extensions → Apps Script**.
-3. Delete everything in the editor's `Code.gs` and paste in the contents of [`apps-script/Code.gs`](apps-script/Code.gs). Optionally, set a `SECRET` at the top (see [Configuration](#configuration)).
-4. *(Optional, recommended.)* Open **Project Settings** (gear icon), tick **Show "appsscript.json" manifest file in editor**, open `appsscript.json` and replace its contents with [`apps-script/appsscript.json`](apps-script/appsscript.json). This limits the script's access to this one spreadsheet.
-5. Click **Save**, choose **`setup`** in the function dropdown next to **Run**, then click **Run**.
-6. Google asks for authorization: **Review permissions** → pick your account → **Advanced** → **Go to *(project name)* (unsafe)** → **Allow**. The warning appears because the script is your own and hasn't been reviewed by Google. It only runs inside your account.
-7. Go back to the sheet. You now have **Applications** and **Summary** tabs, and a **Job Tracker** menu (reload the sheet if the menu isn't there yet).
-8. In Apps Script, click **Deploy → New deployment**, click the gear next to *Select type* and choose **Web app**, then set:
-   - **Execute as:** *Me*
-   - **Who has access:** *Anyone*
-9. Click **Deploy** and copy the **Web app URL**. It ends in `/exec`.
+It works in Google Chrome, Microsoft Edge, Brave and other Chromium-based browsers (version 116 or newer). To run it from source instead, see [Development](#development).
 
-> **After editing `Code.gs` later**, go to **Deploy → Manage deployments → ✏️ Edit → Version: New version → Deploy**. The URL stays the same.
+## Getting started
 
-### Part 2: Load the extension
+1. After installing, the settings page opens by itself. You can also right-click the extension icon and choose **Options**.
+2. Click **Connect Google Sheets**.
+3. Pick your Google account and approve the consent screen. The extension asks for one permission: to see and edit only the Google Drive files it creates.
+4. A **Job Applications Tracker** spreadsheet is created in your Drive, with dropdowns, colors, a filter and a Summary tab. If you connected before, for example on another computer, you can choose **Use existing sheet** or **Create new** instead.
+5. The page shows **✓ Connected** with an **Open sheet** link.
 
-1. Download this repository: **Code → Download ZIP** (then unzip it), or run:
-   ```sh
-   git clone https://github.com/piyushd12/job-application-tracking-extension.git
-   ```
-2. Open the extensions page:
-   - Chrome: `chrome://extensions`
-   - Edge: `edge://extensions`
-   - Brave: `brave://extensions`
-3. Turn on **Developer mode**.
-4. Click **Load unpacked** and select the **`extension`** folder inside the repository (not the repository root).
-5. *(Optional)* Pin the extension from the puzzle-piece menu so its icon is always visible.
+That's all. Open any job posting and look for the tab on the right edge.
 
-### Part 3: Connect the extension to your sheet
-
-1. The settings page opens automatically after installation. You can also right-click the extension icon and choose **Options**.
-2. Paste the Web App URL from Part 1. If you set a `SECRET` in `Code.gs`, enter the same value under **Secret**.
-3. Click **Test connection**. You should see something like **✓ Connected to "Job Hunt" · 0 jobs saved. Settings saved.**
-
-You're done. Open any job posting and look for the tab on the right edge.
+To stop, click **Disconnect** in the settings. This revokes the extension's access to your Google account. Your sheet stays in your Drive.
 
 ## Usage
 
@@ -145,55 +125,55 @@ More ways to use it:
 - **Any page, even if the tab doesn't appear:** click the toolbar icon or press **`Alt+Shift+J`**. Press **`Esc`** to close the panel.
 - **Already saved?** A yellow banner shows the date you saved the job and its current status. You can still save it again.
 - **Hide the tab on a site:** hover over the tab and click the small **×**. You can bring it back from the settings page.
-- **Keep the sheet current:** change a row's **Status** from the dropdown as things progress. *Last Updated* updates by itself.
-- **Mark stale applications:** this happens daily. To run it now, use **Job Tracker → Mark ghosted now** in the sheet.
+- **Keep the sheet current:** change a row's **Status** from the dropdown as things progress. *Last Updated* follows within a day.
+- **Stale applications** are marked **Ghosted** once a day.
 
-## Configuration
+Both daily checks run inside the extension, so they only happen while the browser is open. If the browser was closed, they catch up about a minute after it starts.
 
-### Apps Script settings (top of `Code.gs`)
-
-| Setting | Default | Meaning |
-|---|---|---|
-| `SECRET` | `''` (off) | Optional shared token. When set, the extension must send the same value (enter it in the extension settings). Recommended. |
-| `AUTO_GHOST` | `true` | Every day, mark **Applied** and **OA / Assessment** rows as **Ghosted** when nothing has changed for `GHOST_AFTER_DAYS`. |
-| `GHOST_AFTER_DAYS` | `30` | Days without a change before a row is ghosted. |
-
-After changing these, save the script, run **Job Tracker → Run setup** (this re-creates or removes the daily trigger), and deploy a new version if you changed `SECRET`. The daily job runs around 06:00 in the spreadsheet's time zone (**File → Settings → Time zone** in the sheet); run setup again after changing the time zone.
-
-### Extension settings
+## Settings
 
 | Setting | Options |
 |---|---|
-| Web App URL | The `/exec` URL from your deployment |
-| Secret | Must match `SECRET` in `Code.gs`, or stay empty |
+| Google Sheets | **Connect Google Sheets**, **Open sheet**, **Disconnect** |
+| Automatic upkeep | Mark **Applied** and **OA / Assessment** rows as **Ghosted** (on by default) after a number of days without a change (default 30, from 1 to 365) |
 | Floating button | **Auto**: job pages only (default) · **Always**: every site · **Never**: toolbar icon and shortcut only |
 | Hidden sites | Sites where you clicked ×. Remove one to show the tab there again. |
 | Keyboard shortcut | Shown on the settings page. Change it at `chrome://extensions/shortcuts`. |
 
 ## Privacy & permissions
 
-**Your data never leaves your own Google account.** The extension sends the fields you save to the Apps Script Web App that *you* deployed, and nowhere else. There are no analytics, no tracking, no ads, no remote configuration and no third-party servers. Page content is processed locally in your browser.
+**Your data stays in your own Google account.** The extension talks only to Google's Sheets and Drive APIs, signed in as you, and nothing else. There are no servers run by this project, no analytics, no tracking, no ads and no remote configuration. Page content is processed locally in your browser. The full policy is in [PRIVACY.md](PRIVACY.md).
+
+**It can only see the sheet it creates.** Sign-in asks for a single Google scope, `drive.file`, described by Google as "See, edit, create, and delete only the specific Google Drive files you use with this app". The extension cannot list, open or read any other file in your Drive, including your other spreadsheets. To find a tracker it made before, it looks for a private tag that only this extension can set and read.
+
+You can revoke access at any time with **Disconnect**, or from your Google Account at [myaccount.google.com/permissions](https://myaccount.google.com/permissions).
 
 | Permission | Why it's needed |
 |---|---|
-| `storage` | Saves your settings: Web App URL, secret, button mode, hidden sites. |
+| `identity` | Signs you in with Google so the extension can write to your sheet. |
+| `storage` | Saves your settings (button mode, hidden sites, upkeep options) and the ID of your sheet. |
+| `alarms` | Runs the daily upkeep: *Last Updated* after status changes, and auto-Ghosted. |
 | `activeTab` | When you click the toolbar icon or press the shortcut on a tab that was open before the extension was installed, this lets the extension add the panel to that one tab. |
 | `scripting` | Performs the injection described above. |
-| `script.google.com`, `script.googleusercontent.com` | Lets the extension call your Apps Script Web App. Google serves the script's responses from `googleusercontent.com`. |
+| `sheets.googleapis.com`, `www.googleapis.com` | The Google Sheets API (create the sheet, add rows, look up links) and the Google Drive API (tag the sheet and find it again). |
 | Content script on all `http`/`https` pages | Needed to recognize job postings on *any* website and read their fields. This is why Chrome says the extension can "read and change all your data on all websites". The content script only reads the page. It makes no network requests and sends nothing until you click **Save**. |
-
-**About "Who has access: Anyone".** The extension calls your Web App without your Google login, so the deployment has to accept anonymous requests. The script still runs as you, and it can only append rows to this sheet, look up existing links, and report the spreadsheet's name and row count for **Test connection**. Anyone who learned your Web App URL could do the same, so set a `SECRET` for extra protection. The extension only sends requests (and the secret) to a URL of the form `https://script.google.com/macros/s/…/exec`. It is a simple shared token, sent in requests and stored in your browser profile, so pick a random value you don't use anywhere else.
 
 ## Troubleshooting / FAQ
 
-**"Google returned a sign-in page."**
-The Web App isn't deployed for *Anyone*. In Apps Script, open **Deploy → Manage deployments → ✏️ Edit**, set **Who has access: Anyone**, choose **Version: New version** and click **Deploy**. Also check that you pasted the URL ending in `/exec`, not the `/dev` test URL.
+**"Can't open your tracker sheet… click Reconnect."**
+The sheet was deleted (or moved to the trash), or the extension's access was removed from your Google Account. Open the settings and click **Reconnect**. You can pick an existing tracker or create a new one.
 
-**"The secret doesn't match the SECRET in Code.gs."**
-The value in the extension settings must equal `SECRET` in `Code.gs` exactly. If you changed `Code.gs`, deploy a **new version**, because the old version keeps running until you do.
+**"Google sign-in is needed."**
+Your sign-in expired or was revoked. Open the settings and click **Connect Google Sheets** again. In Edge, Brave and other non-Chrome browsers, Google's sign-in lasts about an hour and is renewed silently while you're signed in to Google in that browser.
 
-**"The sheet isn't set up yet."** (or `"setup": false` when opening the Web App URL)
-The connection works, but the **Applications** tab with its header row doesn't exist yet. In the sheet, choose **Job Tracker → Run setup**, or in the Apps Script editor pick **`setup`** in the function dropdown next to **Run** (it starts on `doGet`, which does nothing useful on its own) and click **Run**. This also fixes renamed or deleted headers. No new deployment is needed.
+**The consent screen says "Google hasn't verified this app".**
+You are using a development build, or the extension is still in Google's testing phase. Click **Continue** only if you installed it yourself from this repository.
+
+**Is the old Apps Script setup still needed?**
+No. The extension now talks to Google Sheets directly. Your old sheet and its Apps Script stay in your Drive untouched. You can delete the Web App deployment, or keep using that sheet by hand. From now on the extension writes to its own new tracker.
+
+**Last Updated or Ghosted didn't change.**
+Both run once a day while the browser is open, and about a minute after it starts. Check that **Automatic upkeep** is on in the settings and that you are connected.
 
 **The floating button doesn't show up.**
 - In **Auto** mode the tab only appears on pages that look like job postings. Use the toolbar icon or `Alt+Shift+J` on any page, or switch the button to **Always**.
@@ -204,8 +184,8 @@ The connection works, but the **Applications** tab with its header row doesn't e
 **A field was extracted wrong.**
 Edit it in the panel before saving. Every field is editable. Job sites change their layouts from time to time. If a supported site keeps getting something wrong, please [open an issue](https://github.com/piyushd12/job-application-tracking-extension/issues) with the page URL (or the site name), the field and the value you expected.
 
-**Can setup be re-run? Will it delete existing rows?**
-Choose **Job Tracker → Run setup** at any time. It only touches formatting, dropdowns, colors, the filter, the Summary tab and the daily trigger. Your rows are never deleted.
+**Can I rename the sheet or move it to another folder?**
+Yes. Renaming or moving the spreadsheet is fine. Keep the **Applications** tab name and its column order, because the extension writes by position.
 
 **"The extension was updated. Reload this page and try again."**
 The extension was reloaded or updated while this tab was open. Reload the page.
@@ -219,25 +199,43 @@ Another extension or the browser may already use `Alt+Shift+J`. Pick a different
 .
 ├── extension/                 # the extension; load this folder unpacked
 │   ├── manifest.json          # Manifest V3
-│   ├── background.js          # service worker: Web App calls, toolbar, shortcut, first-run
+│   ├── config.js              # Google OAuth client IDs
+│   ├── background.js          # service worker: message router, toolbar, shortcut, daily alarm
+│   ├── lib/
+│   │   └── sheets.js          # Google sign-in, Sheets/Drive REST calls, sheet layout, daily upkeep
 │   ├── content/
 │   │   ├── extract.js         # extraction: site readers, JSON-LD, heuristics, field rules
 │   │   └── ui.js              # floating tab + side panel (Shadow DOM)
 │   ├── options/               # settings page
 │   └── icons/                 # generated PNG icons
-├── apps-script/
-│   ├── Code.gs                # Web App API, sheet setup, Summary, triggers, menu
-│   └── appsscript.json        # Apps Script manifest
 ├── scripts/make-icons.js      # regenerates the icons (Node only, no dependencies)
 ├── tests/                     # node:test suites and synthetic HTML fixtures
-└── docs/
-    ├── ARCHITECTURE.md        # design, contracts, extraction strategy
-    └── TESTING.md             # manual QA checklist for a real browser and sheet
+├── docs/
+│   ├── ARCHITECTURE.md        # design, contracts, extraction strategy
+│   ├── GOOGLE_CLOUD_SETUP.md  # maintainers: OAuth clients, consent screen, extension key
+│   ├── PUBLISHING.md          # maintainers: Chrome Web Store submission
+│   └── TESTING.md             # manual QA checklist for a real browser and sheet
+└── PRIVACY.md                 # privacy policy (also used for the store listing)
 ```
 
 ## Development
 
-Requirements: Node.js 22 or newer.
+Requirements: Node.js 22 or newer, and a Google Cloud project with OAuth clients for sign-in.
+
+### Run from source
+
+1. Clone the repository:
+   ```sh
+   git clone https://github.com/piyushd12/job-application-tracking-extension.git
+   ```
+2. Set up Google sign-in once, as described in [docs/GOOGLE_CLOUD_SETUP.md](docs/GOOGLE_CLOUD_SETUP.md): create the OAuth clients, put their IDs in `extension/config.js` and `extension/manifest.json`, and optionally add a manifest `key` so the extension ID never changes.
+3. Open `chrome://extensions` (Edge: `edge://extensions`, Brave: `brave://extensions`) and turn on **Developer mode**.
+4. Click **Load unpacked** and select the **`extension`** folder inside the repository (not the repository root).
+5. The settings page opens. Click **Connect Google Sheets**.
+
+There is no build step. After editing files in `extension/`, click the reload icon on the extension's card in `chrome://extensions` and reload the page you're testing.
+
+### Tests
 
 ```sh
 npm install     # installs jsdom, the only (dev) dependency
@@ -245,38 +243,15 @@ npm test        # runs every test with Node's built-in test runner
 npm run icons   # regenerates extension/icons
 ```
 
-There is no build step. After editing files in `extension/`, click the reload icon on the extension's card in `chrome://extensions` and reload the page you're testing.
-
 The tests cover:
 
 - **Field parsers:** years of experience, work mode, salary, canonical URLs and source names.
 - **Extraction fixtures:** one synthetic HTML page per supported site, a structured-data-only page, a plain career page, a stale-data single-page-app case, and edge cases such as multiple locations, Greenhouse embeds, malformed structured data and very long descriptions.
 - **In-page panel and settings page:** `ui.js` and the options page run in jsdom with a mocked `chrome` API.
-- **Service worker:** where requests and the secret go, and how every reply maps to a message.
-- **Apps Script:** `Code.gs` runs inside `node:vm` with in-memory mocks of `SpreadsheetApp`, `LockService`, `ContentService` and `ScriptApp`.
+- **Sheets layer:** `lib/sheets.js` runs in `node:vm` with a mocked `fetch` and `chrome.identity`. It covers the exact request bodies that create and format the sheet, appending rows, duplicate lookup, the 401 retry, the Edge/Brave sign-in fallback, and the daily ghosting and *Last Updated* logic.
+- **Service worker:** message routing, error messages, the connect flow, the toolbar fallback and the daily alarm.
 
-Automated tests can't cover real sites, real Google deployments or how the panel looks, so [docs/TESTING.md](docs/TESTING.md) has a manual checklist to run in Chrome before a release.
-
-### Adding a new site reader
-
-1. In [`extension/content/extract.js`](extension/content/extract.js), add an entry to `SITE_READERS`:
-   ```js
-   {
-     name: 'Example',
-     matches: (host) => hostIs(host, 'example.com'),
-     isJobPage: (doc, url) => /\/jobs\/\d+/.test(url),
-     read: (doc, url) => ({
-       role: pick(doc, '[data-testid="job-title"]', 'h1'),
-       company: pick(doc, '[data-testid="company-name"]'),
-       location: pick(doc, '[data-testid="job-location"]'),
-       description: pick(doc, '[data-testid="job-description"]'),
-     }),
-   },
-   ```
-   List several selectors per field, most stable first: `data-testid`, `data-automation-id`, `itemprop` or `id` before class names. Fields left empty fall back to structured data and heuristics.
-2. If the site should get its own **Source** label, add it to `SOURCES` in the same file.
-3. Add a small, synthetic fixture in `tests/fixtures/` that mimics the site's markup. It must contain no real job post or personal data.
-4. Add a case to the table in [`tests/extract.test.js`](tests/extract.test.js) and run `npm test`.
+Automated tests can't cover real sites, real Google accounts or how the panel looks, so [docs/TESTING.md](docs/TESTING.md) has a manual checklist to run in Chrome before a release. Publishing steps are in [docs/PUBLISHING.md](docs/PUBLISHING.md).
 
 ## Roadmap
 
@@ -292,11 +267,11 @@ Ideas and votes are welcome in [Issues](https://github.com/piyushd12/job-applica
 Contributions are welcome. Bug reports, new site readers, fixture improvements and docs fixes are all useful.
 
 1. Fork the repository and create a branch.
-2. Keep changes focused, and add or update tests for any extraction or Apps Script change.
+2. Keep changes focused, and add or update tests for any extraction or Sheets change.
 3. Run `npm test` and make sure everything passes.
 4. Open a pull request that explains what changed and why.
 
-Please keep the project's principles in mind: plain JavaScript with no build step, no runtime dependencies, no AI or LLM calls, and no network requests to anything except the user's own Apps Script.
+Please keep the project's principles in mind: plain JavaScript with no build step, no runtime dependencies, no AI or LLM calls, and no network requests to anything except Google's Sheets and Drive APIs on the user's behalf.
 
 ## License
 

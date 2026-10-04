@@ -9,7 +9,7 @@ This document describes the design of **Job Application Tracker**. It is a Manif
 3. [Folder structure](#3-folder-structure)
 4. [Sheet data model](#4-sheet-data-model)
 5. [Message contracts](#5-message-contracts)
-6. [Apps Script API contract](#6-apps-script-api-contract)
+6. [Google API contract](#6-google-api-contract)
 7. [Extraction strategy](#7-extraction-strategy)
 8. [Security and privacy](#8-security-and-privacy)
 9. [Testing strategy](#9-testing-strategy)
@@ -27,29 +27,32 @@ This document describes the design of **Job Application Tracker**. It is a Manif
 - The toolbar icon and **Alt+Shift+J** open the same panel on any page, even where auto-detection missed it.
 - A small **×** on the floating tab hides it for that site.
 - A setting chooses when the tab shows: `auto` (job pages only, the default), `always` or `never`.
+- Setup is one button: **Connect Google Sheets** signs in with Google and creates a fully formatted tracker spreadsheet in the user's Drive.
 
 ### Moving parts
 
 | Part | Runs in | Responsibility |
 |---|---|---|
 | Content scripts | Every http/https page (isolated world) | Detect job pages, extract fields, render the button and panel in Shadow DOM |
-| Service worker | Extension background | Every network call to the Web App, toolbar/shortcut handling, first-run options page |
-| Options page | Extension page | Web App URL, secret, test connection (shows the spreadsheet name and saved-job count, and saves the settings when it succeeds), button mode, hidden sites, current shortcut |
-| Apps Script Web App | Google, bound to the user's sheet | Validate, deduplicate, append rows, sheet setup, triggers |
+| Service worker | Extension background | Message router, toolbar/shortcut handling, first-run options page, daily upkeep alarm |
+| `lib/sheets.js` | Loaded into the service worker | Google sign-in, every Sheets and Drive REST call, the sheet layout, duplicate lookup, the upkeep logic |
+| Options page | Extension page | Connect / choose / disconnect, upkeep settings, button mode, hidden sites, current shortcut |
 | Google Sheet | User's Drive | The data. The Summary tab is built from formulas only |
 
 ### Assumptions
 
-- **One user, one sheet.** Each user makes their own copy of the sheet, pastes `Code.gs` into its bound Apps Script project, runs `setup()` and deploys a Web App with *Execute as: Me* and *Who has access: Anyone*. The project runs no shared backend.
-- **No build step.** The extension is plain JavaScript and is loaded unpacked in Chrome, Edge or Brave (Chromium 116+). It uses no frameworks, bundlers or transpilers.
+- **One user, one sheet, no backend.** The extension calls Google's APIs directly with the user's own OAuth token. The project runs no server.
+- **Scope `drive.file` only.** The extension can see only files it created (or that the user opened with it). It never requests the full `spreadsheets` or `drive` scopes.
+- **No build step.** The extension is plain JavaScript and runs in Chrome, Edge or Brave (Chromium 116+). It uses no frameworks, bundlers or transpilers. The service worker is a classic script that pulls in `config.js` and `lib/sheets.js` with `importScripts`.
 - **Deterministic extraction only.** It uses no LLM or AI APIs. Every value comes from selectors, structured data or regular expressions, so the same page always gives the same result.
 - **English-first heuristics.** YOE, work-mode and salary patterns target English job posts. Site readers and JSON-LD work for any language.
-- **Redeploys are manual.** After changing `Code.gs`, the user creates a new deployment version. The `/exec` URL stays the same when they edit the existing deployment.
-- **Apps Script always returns HTTP 200.** A Web App cannot set status codes, so success or failure is carried in the JSON body (`ok`).
+- **Background work needs the browser.** Auto-Ghosted and *Last Updated* after manual edits run from a `chrome.alarms` alarm, so they happen only while the browser is open and catch up shortly after it starts.
 
 ---
 
 ## 2. Request flow
+
+### Saving a job
 
 ```mermaid
 sequenceDiagram
@@ -57,8 +60,8 @@ sequenceDiagram
     actor U as User
     participant P as Job page
     participant CS as Content script<br/>(extract.js, ui.js)
-    participant SW as Service worker<br/>(background.js)
-    participant AS as Apps Script Web App<br/>(Code.gs)
+    participant SW as Service worker<br/>(background.js + lib/sheets.js)
+    participant G as Google Sheets API
     participant S as Google Sheet
 
     P->>CS: document_idle / SPA URL change
@@ -68,24 +71,53 @@ sequenceDiagram
     CS->>CS: JobExtract.extractJob(document, location.href) → job
     CS-->>U: open panel with pre-filled, editable fields
     CS->>SW: check-duplicate {url}
-    SW->>AS: GET ?action=check&url=…&token=…
-    AS->>S: scan Job Link column (normalized compare)
-    S-->>AS: match row (or none)
-    AS-->>SW: {ok:true, found, appliedDate, status, row}
-    SW-->>CS: same payload
+    SW->>G: values.get Applications!J2:J (cached 60 s)
+    G-->>SW: Job Link column
+    SW->>G: values.get Applications!A{n}:L{n} for the newest normalized match
+    SW-->>CS: {ok:true, found, appliedDate, status, row}
     CS-->>U: "Already saved on 03 Oct 2026, status Applied" (if found)
     U->>CS: edit fields, click Save
     CS->>CS: validate (Company or Role, valid URL)
     CS->>SW: add-job {job}
-    SW->>AS: POST text/plain {action:"add", job, token}
-    AS->>AS: LockService.tryLock, sanitize cells
-    AS->>S: setValues on the next free row
-    AS-->>SW: {ok:true, row, sheetUrl}
-    SW-->>CS: same payload
+    SW->>SW: validate, sanitize cells
+    SW->>G: spreadsheets.get (Applications sheetId, rowCount)
+    SW->>G: values.append Applications!A:L, USER_ENTERED
+    G->>S: write the next free row
+    SW->>G: batchUpdate insertDimension (only when < 50 free rows remain)
+    SW-->>CS: {ok:true, row, sheetUrl}
     CS-->>U: "Saved to row 42 · Open sheet"
 ```
 
-The service worker makes every network call. Content scripts run under the page's origin rules and would hit CORS. The extension has host permissions for `script.google.com` and `script.googleusercontent.com`, which is where the Web App redirects its response.
+### Connecting
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant O as Options page
+    participant SW as Service worker
+    participant A as Google sign-in
+    participant D as Drive API
+    participant G as Sheets API
+
+    U->>O: click Connect Google Sheets
+    O->>SW: connect
+    SW->>A: getAuthToken / launchWebAuthFlow (interactive)
+    A-->>U: consent screen (drive.file)
+    A-->>SW: access token
+    SW->>D: files.list q="appProperties has { key='jobTracker' and value='1' } and trashed=false"
+    alt a tracker exists
+        SW-->>O: {existing}
+        U->>O: Use existing sheet / Create new
+        O->>SW: use-sheet {id} / create-sheet
+    end
+    SW->>G: spreadsheets.create (Applications id 0, Summary id 1)
+    SW->>G: ONE batchUpdate with the whole layout
+    SW->>D: files.update appProperties {jobTracker:"1"}
+    SW-->>O: {sheet:{id, name, url}} → "✓ Connected"
+```
+
+The service worker makes every network call. Content scripts run under the page's origin rules and would hit CORS, and only the worker holds the OAuth token.
 
 ---
 
@@ -95,7 +127,10 @@ The service worker makes every network call. Content scripts run under the page'
 .
 ├── extension/                 # load this folder unpacked
 │   ├── manifest.json
-│   ├── background.js          # service worker: fetch, commands, action click, onInstalled
+│   ├── config.js              # OAuth client IDs (Chrome Extension client + Web application client)
+│   ├── background.js          # service worker: router, commands, action click, onInstalled, alarms
+│   ├── lib/
+│   │   └── sheets.js          # sign-in, Sheets/Drive REST, sheet layout, lookup, upkeep
 │   ├── content/
 │   │   ├── extract.js         # pure logic: site readers, JSON-LD, heuristics, field parsers, canonicalUrl, source map
 │   │   └── ui.js              # Shadow DOM button + panel, SPA watcher, messaging
@@ -103,9 +138,6 @@ The service worker makes every network call. Content scripts run under the page'
 │   │   ├── options.html
 │   │   └── options.js
 │   └── icons/                 # 16, 32, 48, 128 px PNG (generated by scripts/make-icons.js)
-├── apps-script/
-│   ├── Code.gs                # doGet/doPost, setup, onOpen, onEdit, markGhosted
-│   └── appsscript.json        # manifest: webapp config, scopes, runtime V8
 ├── scripts/
 │   └── make-icons.js          # regenerates extension/icons with Node's zlib (npm run icons)
 ├── tests/
@@ -113,12 +145,15 @@ The service worker makes every network call. Content scripts run under the page'
 │   ├── fields.test.js         # YOE, work mode, salary, canonical URL, source map
 │   ├── extract.test.js        # fixture-driven end-to-end extraction, including edge cases
 │   ├── ui.test.js             # ui.js in jsdom: panel flow, key/focus isolation, single instance, detection budget
-│   ├── options.test.js        # options page in jsdom: URL validation, connection test, settings
-│   ├── background.test.js     # background.js in node:vm: token routing, error mapping, toolbar fallback
-│   └── apps-script.test.js    # Code.gs in node:vm with mocked Google services
+│   ├── options.test.js        # options page in jsdom: connect states, legacy notice, upkeep settings
+│   ├── sheets.test.js         # lib/sheets.js in node:vm: request bodies, append, lookup, auth, upkeep
+│   └── background.test.js     # background.js in node:vm: routing, errors, connect flow, toolbar, alarm
 ├── docs/
 │   ├── ARCHITECTURE.md
+│   ├── GOOGLE_CLOUD_SETUP.md  # OAuth clients, consent screen, manifest key
+│   ├── PUBLISHING.md          # Chrome Web Store submission
 │   └── TESTING.md             # manual QA checklist for a real browser and sheet
+├── PRIVACY.md
 ├── package.json               # "test": "node --test"; devDependencies: jsdom only
 ├── README.md
 └── LICENSE
@@ -138,13 +173,20 @@ The service worker makes every network call. Content scripts run under the page'
 
 The public API is `JobExtract = { extractJob, isLikelyJobPage, canonicalUrl, extractYOE, workModeFrom, salaryFromText }`, plus `sourceFromHost`, `readJsonLdPostings` and `SOURCE_NAMES` for the UI and tests. The site readers live inside `extract.js` as a plain array, so the whole extraction pipeline is one file with no load-order coupling. The manifest loads `extract.js` before `ui.js`.
 
+The service worker starts with `importScripts('config.js', 'lib/sheets.js')`. Both are plain scripts whose top-level functions and constants become worker globals; the tests load them into a `node:vm` context the same way.
+
 ### Manifest essentials
 
 ```jsonc
 {
   "manifest_version": 3,
-  "permissions": ["storage", "activeTab", "scripting"],
-  "host_permissions": ["https://script.google.com/*", "https://script.googleusercontent.com/*"],
+  "permissions": ["storage", "activeTab", "scripting", "identity", "alarms"],
+  "host_permissions": ["https://sheets.googleapis.com/*", "https://www.googleapis.com/*"],
+  "oauth2": {
+    "client_id": "<Chrome Extension client ID>.apps.googleusercontent.com",
+    "scopes": ["https://www.googleapis.com/auth/drive.file"]
+  },
+  // optional "key": "<base64 public key>" pins the extension ID (docs/GOOGLE_CLOUD_SETUP.md)
   "background": { "service_worker": "background.js" },
   "action": { "default_title": "Save this job to your sheet (Alt+Shift+J)" },
   "commands": { "_execute_action": { "suggested_key": { "default": "Alt+Shift+J" } } },
@@ -163,13 +205,13 @@ The public API is `JobExtract = { extractJob, isLikelyJobPage, canonicalUrl, ext
 
 ### `Applications` tab
 
-The header is in row 1, which is frozen. Data starts at row 2. `setup()` pre-formats about 1,000 data rows (plain-text columns, date formats, dropdowns, status colors) and a filter covers all of them. When fewer than 50 empty rows remain, `add` inserts 500 more and re-applies the same formatting, so new rows never lose their dropdowns or colors.
+The header is in row 1, which is frozen. Data starts at row 2. `createTrackerSpreadsheet()` creates the tab with 1,001 rows and pre-formats the 1,000 data rows (plain-text columns, date formats, dropdowns, status colors), and a filter covers all of them. When fewer than 50 empty rows remain after a save, `appendJob` inserts 500 more with `insertDimension` and `inheritFromBefore: true`, just below the row it wrote. The new rows sit inside every formatted range, so they inherit the number formats and the dropdowns, colors and filter stretch over them.
 
 | # | Column | Stored as | Format / validation | Set by |
 |---|---|---|---|---|
 | A | Company | Text | `@` plain text | Panel |
 | B | Role | Text | `@` | Panel |
-| C | Applied Date | Date | `dd mmm yyyy` | Panel (defaults to today). Sent as `YYYY-MM-DD`, which Sheets parses in the spreadsheet time zone |
+| C | Applied Date | Date | `dd mmm yyyy` | Panel (defaults to today). Sent as `YYYY-MM-DD` with `USER_ENTERED`, which Sheets parses as a date |
 | D | Status | Text | Dropdown (strict): Saved, Applied, OA / Assessment, Interview, Offer, Rejected, Ghosted, Withdrawn | Panel (default `Applied`) |
 | E | Work Mode | Text | Dropdown (strict): On-site, Remote, Hybrid, N/A | Panel |
 | F | Location | Text | `@` | Panel |
@@ -177,7 +219,7 @@ The header is in row 1, which is frozen. Data starts at row 2. `setup()` pre-for
 | H | Salary / CTC | Text | `@` | Panel (blank if none found) |
 | I | Source | Text | `@` | Panel (from hostname, editable) |
 | J | Job Link | Text | `@` | Panel (canonical URL). Used for duplicate checks |
-| K | Last Updated | Date-time | `dd mmm yyyy` | Server on add; `onEdit` on Status change; `markGhosted` |
+| K | Last Updated | Date | `dd mmm yyyy` | `appendJob` on save; the daily upkeep after a Status change and when ghosting |
 | L | Notes | Text | `@` | Panel |
 
 Every text column is formatted `@`. This is plain-text formatting, so Sheets never turns values like `2-5`, `10-12` or `1/2` into dates or numbers. Column widths are set so Company, Role and Notes are wide, and the date and dropdown columns are narrow.
@@ -195,12 +237,17 @@ Every text column is formatted `@`. This is plain-text formatting, so Sheets nev
 | Ghosted | `#5f6368` dark grey | `#ffffff` |
 | Withdrawn | `#e6d5c3` brown | `#6d4c2f` |
 
-### Automation
+### Automation (daily upkeep)
 
-- **Last Updated on status change.** A simple `onEdit(e)` trigger fires when the edited range overlaps column D at row 2 or below. It sets column K to `new Date()` for every edited row, so multi-row pastes are handled too. Edits made by scripts do not fire `onEdit`, so `markGhosted` sets K itself.
-- **Auto-Ghosted.** A daily time trigger runs `markGhosted()` at 06:00 in the spreadsheet's time zone. Rows with status `Applied` or `OA / Assessment` whose Last Updated is older than `GHOST_AFTER_DAYS` (default `30`) change to `Ghosted`, and their K is updated. If K is blank, Applied Date is used. Rows with neither date (or text that isn't a date) are left alone. Setting `AUTO_GHOST = false` turns the feature off: `markGhosted()` becomes a no-op and the next `setup()` removes the trigger. The **Mark ghosted now** menu item runs the same check on demand, whatever `AUTO_GHOST` says.
+Google Apps Script could react to edits and run on a timer inside Google. Without it, both features run in the service worker from a `chrome.alarms` alarm named `daily-upkeep`:
 
-### `Summary` tab (formulas only, rebuilt by `setup()`)
+- **Scheduling.** `runtime.onInstalled` and `runtime.onStartup` (re-)create the alarm with `delayInMinutes: 1, periodInMinutes: 1440`. Chrome may drop alarms on restart, so re-creating it on every start is what guarantees the catch-up run about a minute after the browser opens. It then runs once a day while the browser is open.
+- **One read, one write.** `runUpkeep()` reads `Applications!A2:L` with `valueRenderOption=UNFORMATTED_VALUE` and `dateTimeRenderOption=SERIAL_NUMBER`. The pure function `planUpkeep(rows, snapshot, settings)` decides the changes, and they go out in one `values.batchUpdate` (`USER_ENTERED`, ISO dates).
+- **Last Updated after a manual Status change.** `chrome.storage.local.statusSnapshot` maps each Job Link to the Status seen on the previous run (a link saved twice gets a second key, `<link> #2`). A row whose Status differs from its snapshot entry, and isn't blank, gets K = today. `appendJob` adds an entry for every saved row, so a change made before the next run is still noticed. The snapshot is rebuilt from the current rows on every run (deleted rows drop out) and saved only after the write succeeds, so a failed run is retried in full.
+- **Auto-Ghosted.** When enabled (`autoGhost`, on by default), rows with status `Applied` or `OA / Assessment` whose Last Updated (or Applied Date when K is blank) is more than `ghostAfterDays` (default 30) days old become `Ghosted`, and K is set to today. A row whose Status was just changed by hand is not ghosted in the same run. Rows with no usable date are left alone.
+- Errors (not connected, signed out, offline) are logged and skipped; the next run tries again.
+
+### `Summary` tab (formulas only, written by `createTrackerSpreadsheet()`)
 
 `D` means `Applications!D2:D` and `C` means `Applications!C2:C`.
 
@@ -221,7 +268,7 @@ Status is a single current value, so an application that went Interview → Reje
 
 ## 5. Message contracts
 
-All messages use `chrome.runtime.sendMessage` or `chrome.tabs.sendMessage` with a kebab-case `type` field. The service worker's router returns `true` so it can reply asynchronously through `sendResponse`. Every failure reply from the service worker has the shape `{ ok:false, error:Code, message:string }`, where `message` is the friendly text from §6, so the panel and the options page share one set of messages.
+All messages use `chrome.runtime.sendMessage` or `chrome.tabs.sendMessage` with a kebab-case `type` field. The service worker's router returns `true` so it can reply asynchronously through `sendResponse`. Every failure reply from the service worker has the shape `{ ok:false, error:Code, message:string, detail:string }`. `message` is the friendly text from §6, shared by the panel and the options page; `detail` is Google's own error text (the options page appends it), or for `BAD_REQUEST` the validation problem, which is also part of `message`.
 
 ### Job object
 
@@ -239,21 +286,30 @@ type Job = {
   url: string;          // canonical, must parse as http(s) URL
   notes: string;
 };
+type Sheet = { id: string; name: string; url: string };  // url: https://docs.google.com/spreadsheets/d/<id>/edit
 ```
 
 ### Content script → service worker
 
+These never show a consent screen: they use a silent token and report `SIGNED_OUT` when none is available.
+
 | `type` | Payload | Response |
 |---|---|---|
-| `add-job` | `{ job: Job }` | `{ ok:true, row:number, sheetUrl:string }` or `{ ok:false, error, message }` |
-| `check-duplicate` | `{ url: string }` (canonical) | `{ ok:true, found:false }` or `{ ok:true, found:true, row, appliedDate:"03 Oct 2026", status }` or `{ ok:false, error, message }` |
+| `add-job` | `{ job: Job }` | `{ ok:true, row:number, sheetUrl:string }` or a failure |
+| `check-duplicate` | `{ url: string }` (canonical) | `{ ok:true, found:false }` or `{ ok:true, found:true, row, appliedDate:"03 Oct 2026", status }` or a failure |
 | `open-options` | none | Opens the options page (content scripts can't call `runtime.openOptionsPage`) |
 
 ### Options page → service worker
 
 | `type` | Payload | Response |
 |---|---|---|
-| `ping` | `{ webAppUrl, secret }` (unsaved form values, so you can test before saving) | `{ ok:true, setup:boolean, version:number, sheetName:string, rows:number }` or `{ ok:false, error, message }` |
+| `status` | none | `{ ok:true, connected:false }`, `{ ok:true, connected:true, sheet:Sheet }` or a failure (`SHEET_GONE` when the file was deleted, trashed or unshared) |
+| `connect` | none | Interactive sign-in, then `{ ok:true, existing:Sheet }` when a tagged tracker exists, otherwise creates one and returns `{ ok:true, sheet:Sheet }` |
+| `use-sheet` | `{ id }` | `{ ok:true, sheet:Sheet }` |
+| `create-sheet` | none | `{ ok:true, sheet:Sheet }` |
+| `disconnect` | none | Revokes the token, clears the stored sheet ID, snapshot and caches. `{ ok:true }` |
+
+Connecting stores the sheet ID and removes the old Apps Script settings (`webAppUrl`, `secret`) from `chrome.storage.sync`.
 
 ### Service worker → content script
 
@@ -261,84 +317,75 @@ type Job = {
 |---|---|---|
 | `open-panel` | `chrome.action.onClicked` (also fired by the `_execute_action` command, Alt+Shift+J) | Re-extract and open the panel. This works even when the page is not detected as a job page, the site is hidden, or the mode is `never`. |
 
-If no Web App URL is saved yet, the toolbar click opens the options page instead. If `tabs.sendMessage` fails because no content script is in the tab (the tab was open before install, or the extension was updated), the worker injects both content files with `chrome.scripting.executeScript`. The `activeTab` grant from the click or shortcut covers this. It then retries the message once. On pages where injection is forbidden (`chrome://` pages, the Web Store, `file://` without file access, the PDF viewer) the worker shows a red **!** badge on the icon for that tab, with a tooltip that explains why. Chrome clears per-tab badges when the tab navigates.
+If no sheet is connected yet, the toolbar click opens the options page instead. If `tabs.sendMessage` fails because no content script is in the tab (the tab was open before install, or the extension was updated), the worker injects both content files with `chrome.scripting.executeScript`. The `activeTab` grant from the click or shortcut covers this. It then retries the message once. On pages where injection is forbidden (`chrome://` pages, the Web Store, `file://` without file access, the PDF viewer) the worker shows a red **!** badge on the icon for that tab, with a tooltip that explains why. Chrome clears per-tab badges when the tab navigates.
 
 **One live content script per page.** The injection fallback can race the manifest's own `document_idle` injection, and reloading the extension leaves an orphaned copy behind. On start, `ui.js` dispatches a cancelable `job-tracker-ext:hello` event on `document`. Every running copy listens for it: a live copy cancels it, which tells the newcomer to stop, and an orphaned copy (`chrome.runtime.id` is gone) tears itself down. Only then does the newcomer remove any leftover host element and mount.
 
-### Settings (`chrome.storage.sync`)
+### Storage
 
-| Key | Type | Default | Written by |
-|---|---|---|---|
-| `webAppUrl` | string | `""` | Options |
-| `secret` | string | `""` | Options |
-| `buttonMode` | `"auto" \| "always" \| "never"` | `"auto"` | Options |
-| `hiddenSites` | string[] (hostnames) | `[]` | Content (× on button), Options (remove) |
+| Area | Key | Type | Default | Written by |
+|---|---|---|---|---|
+| `sync` | `buttonMode` | `"auto" \| "always" \| "never"` | `"auto"` | Options |
+| `sync` | `hiddenSites` | string[] (hostnames) | `[]` | Content (× on button), Options (remove) |
+| `sync` | `autoGhost` | boolean | `true` | Options |
+| `sync` | `ghostAfterDays` | integer 1–365 | `30` | Options |
+| `local` | `spreadsheetId` | string | none | Service worker on connect; removed on disconnect |
+| `local` | `statusSnapshot` | `{ [jobLink]: status }` | `{}` | Service worker (save, daily upkeep) |
+| `session` | `webToken` | `{ token, expiresAt }` | none | Web-flow sign-in (Edge, Brave, …) |
+| `session` | `linkCache` | `{ id, links, at }` | none | Duplicate lookup, 60 s |
 
-Content scripts read the settings directly and listen to `chrome.storage.onChanged`, so changes apply to open tabs right away. On `runtime.onInstalled` with `reason === "install"`, the worker calls `chrome.runtime.openOptionsPage()`.
+The sheet ID is per device (`local`), because sign-in is per browser profile. Connecting on a second computer finds the same tracker through its Drive tag and offers **Use existing sheet**. Content scripts read the sync settings directly and listen to `chrome.storage.onChanged`, so changes apply to open tabs right away. On `runtime.onInstalled` with `reason === "install"`, the worker calls `chrome.runtime.openOptionsPage()`. If the old `webAppUrl` or `secret` settings are found, the options page shows a one-time notice asking the user to click **Connect Google Sheets** and deletes them.
 
 ---
 
-## 6. Apps Script API contract
+## 6. Google API contract
 
-The base URL is the deployed Web App, `https://script.google.com/macros/s/<id>/exec`.
+### Sign-in
 
-### Requests
+- **Google Chrome** (`navigator.userAgentData.brands` contains "Google Chrome"): `chrome.identity.getAuthToken({ interactive, scopes: [drive.file] })` with the **Chrome Extension** OAuth client from `manifest.json` → `oauth2.client_id`. Chrome caches and refreshes the token.
+- **Edge, Brave and other Chromium browsers**, where `getAuthToken` is unavailable: `chrome.identity.launchWebAuthFlow` with the OAuth implicit flow (`response_type=token`) against the **Web application** client in `config.js`, redirecting to `chrome.identity.getRedirectURL()` = `https://<extension-id>.chromiumapp.org/`. The token (about one hour) is cached in `chrome.storage.session`. The silent attempt adds `prompt=none`.
+- **Silent first.** Every call uses a non-interactive token. Only the options page's **Connect** (a click) signs in interactively.
+- **401 → retry once.** On a 401 the cached token is removed (`removeCachedAuthToken`, or the session entry) and the request is retried once with a fresh silent token. A second 401 is `SIGNED_OUT`.
+- **Disconnect** posts the token to `https://oauth2.googleapis.com/revoke` (`mode: "no-cors"`, so no host permission is needed and the reply is ignored), then clears every cached token, the stored sheet ID, the snapshot and the caches.
 
-| Method | Request | Purpose |
-|---|---|---|
-| GET | `?action=ping&token=<secret>` | Connection test. Returns `{ok:true, version, setup, sheetName, rows}`, where `sheetName` is the spreadsheet's name and `rows` the number of saved jobs |
-| GET | `?action=check&url=<canonical>&token=<secret>` | Duplicate lookup. Both the requested link and every Job Link cell are normalized (lower-cased, no scheme, `www.`, `#hash`, tracking parameters, `/apply` or trailing slash; remaining parameters sorted) and compared, newest row first. Links typed by hand still match |
-| POST | Header `Content-Type: text/plain;charset=utf-8`. Body: `{"action":"add","job":{…},"token":"<secret>"}` | Append a row. `text/plain` makes this a *simple request*, so no CORS preflight is sent |
+### Requests (`lib/sheets.js`)
 
-### Responses
+All requests send `Authorization: Bearer <token>` and time out after 20 s.
 
-Always `ContentService` JSON with HTTP 200. Writes are only accepted through POST; a GET with `action=add` returns `UNKNOWN_ACTION`.
+| Function | Request |
+|---|---|
+| `createTrackerSpreadsheet()` | `POST sheets/v4/spreadsheets` with title "Job Applications Tracker", tabs Applications (`sheetId` 0, 1,001 × 12) and Summary (`sheetId` 1). Then **one** `:batchUpdate` with `setupRequests()`: header cells and style, frozen row, row height, column widths, `TEXT` and `DATE dd mmm yyyy` number formats, two `ONE_OF_LIST` validations (strict), eight `TEXT_EQ` conditional-format rules, `setBasicFilter`, and the Summary cells, formats and widths. Then `PATCH drive/v3/files/<id>` with `appProperties: { jobTracker: "1" }` |
+| `findExistingTracker()` | `GET drive/v3/files?q=appProperties has { key='jobTracker' and value='1' } and trashed=false&orderBy=modifiedTime desc` |
+| `getTrackerInfo(id)` | `GET drive/v3/files/<id>?fields=id,name,trashed` |
+| `appendJob(job)` | `GET spreadsheets/<id>?fields=sheets.properties(sheetId,title,gridProperties.rowCount)`, then `POST values/Applications!A:L:append?valueInputOption=USER_ENTERED&insertDataOption=OVERWRITE`, then (when the sheet is nearly full) `:batchUpdate` with one `insertDimension` |
+| `findByLink(url)` | `GET values/Applications!J2:J` (cached 60 s in `chrome.storage.session`), then `GET values/Applications!A<n>:L<n>` for the match |
+| `runUpkeep(settings)` | `GET values/Applications!A2:L?valueRenderOption=UNFORMATTED_VALUE&dateTimeRenderOption=SERIAL_NUMBER`, then `POST values:batchUpdate` when something changed |
 
-```jsonc
-{ "ok": true,  "row": 42, "sheetUrl": "https://docs.google.com/spreadsheets/d/…/edit#gid=0&range=A42" }
-{ "ok": false, "error": "BAD_TOKEN" }
-```
+Drive `appProperties` are private to the Google Cloud project that set them, so only this extension can tag or find its trackers, and both OAuth clients must live in the same project.
 
 ### Error codes
 
 | Code | Raised by | Meaning | Friendly message in panel/options |
 |---|---|---|---|
-| `NOT_CONFIGURED` | Service worker | No Web App URL saved, or the saved one is not a `https://script.google.com/macros/s/…/exec` (or `/a/macros/<domain>/s/…/exec`) URL. The token is never sent anywhere else | "Add your Web App URL in Settings first." (with a link to options) |
-| `NOT_PUBLIC` | Service worker | The response was a Google sign-in page, or the request was redirected away from the script hosts (see below) | "Google returned a sign-in page. Redeploy the Web App with *Who has access: Anyone*." |
-| `NETWORK` | Service worker | fetch failed or the 20 s timeout was reached (`AbortSignal.timeout`) | "Couldn't reach Google. Check your connection and try again." |
-| `BAD_RESPONSE` | Service worker | The body is not valid JSON in the expected shape | "Unexpected reply from the Web App. Is the URL the `/exec` link?" |
-| `BAD_TOKEN` | Apps Script | `SECRET` is set and the token doesn't match | "Secret token doesn't match the one in Code.gs." |
-| `BAD_REQUEST` | Apps Script | Bad JSON, a missing job, neither company nor role, or an invalid URL | "The job data was rejected: <detail>." |
-| `UNKNOWN_ACTION` | Apps Script | The action is not ping, check or add | "Extension and script versions don't match. Update Code.gs." |
-| `SETUP_REQUIRED` | Apps Script | The `Applications` tab or its header is missing | "Sheet isn't set up. In the sheet: Job Tracker → Run setup." |
-| `LOCK_TIMEOUT` | Apps Script | `LockService` could not get the lock within 10 s | "The sheet is busy. Try again in a moment." |
-| `INTERNAL` | Apps Script | Any other exception (the message is logged, not returned) | "Something went wrong in the script. Check Executions in Apps Script." |
+| `NOT_CONNECTED` | Sheets layer | No sheet ID stored yet | "Connect Google Sheets in Settings first." |
+| `SIGNED_OUT` | Sheets layer | No token could be obtained silently, the user cancelled the consent screen, or Google answered 401 twice | "Google sign-in is needed. Open Settings and click Connect Google Sheets." |
+| `SHEET_GONE` | Sheets layer | Google answered 403 or 404, or the file is in the trash: the sheet was deleted or access was removed | "Can't open your tracker sheet. It may have been deleted, or access was removed. Open Settings and click Reconnect." |
+| `SETUP_REQUIRED` | Sheets layer | The spreadsheet has no `Applications` tab | "Your tracker sheet has no "Applications" tab. Rename it back, or open Settings and click Reconnect to create a new sheet." |
+| `BUSY` | Sheets layer | HTTP 429 (quota) | "Google Sheets is busy. Try again in a moment." |
+| `NETWORK` | Sheets layer | fetch failed or the 20 s timeout was reached | "Couldn't reach Google. Check your connection and try again." |
+| `GOOGLE_ERROR` | Sheets layer | Any other non-OK reply, or an append reply without a row | "Google Sheets returned an error. Try again in a moment." |
+| `BAD_REQUEST` | Sheets layer | Missing job, neither company nor role, invalid URL, or an invalid sheet ID | "The job data was rejected. <detail>" |
+| `INTERNAL` | Service worker | Any other exception | "Something went wrong in the extension. Try again." |
 | `RELOADED` | Content script | The extension was reloaded or updated, so this page's content script can no longer reach the service worker | "The extension was updated. Reload this page and try again." |
 
-### Detecting a Web App that isn't public
+### Row rules
 
-A deployment that is not shared with *Anyone* redirects to `accounts.google.com`. The extension has no host permission there, so the followed `fetch` fails like a network error. When a request fails (and it was not a timeout), the service worker sends one more request to the same URL with `redirect: "manual"`. If that returns an `opaqueredirect`, the server is reachable and was sending us elsewhere, so the error is `NOT_PUBLIC`; otherwise it is `NETWORK`. If Chrome does follow the redirect, the HTML sign-in page is detected from the final URL or the body instead. Requests use `credentials: "omit"`, so the result never depends on the user's Google cookies.
-
-### Server-side rules
-
-- **Config.** These constants sit at the top of `Code.gs`:
-  - `SECRET = ''`. Empty means no check. Otherwise the request token must equal it.
-  - `AUTO_GHOST = true`. Turns the daily auto-ghost trigger on or off.
-  - `GHOST_AFTER_DAYS = 30`. Days without change before a row is ghosted.
-  - Internal names such as `SHEET_NAME = 'Applications'` and `SUMMARY_NAME = 'Summary'` sit below the settings block.
-- **Duplicate lookup.** `check` reads only the Job Link column (one narrow `getValues`), scans it from the bottom and reads the single matching row for its date and status. Workday locale prefixes (`/en-us/`) are also ignored when comparing.
-- **Applied Date.** Accepted only as a real `YYYY-MM-DD` calendar date; anything else becomes today in the spreadsheet's time zone.
-- **Locking.** `add` and `markGhosted` run inside `LockService.getScriptLock().tryLock(10000)` and release it in a `finally` block.
-- **Formula-injection guard.** Before writing, any string cell that starts with `=`, `+`, `-`, `@`, tab or CR is prefixed with `'`. This applies to every field, including Notes.
-- **Server re-validation.** Company or Role must be present. `url` must parse as http(s). `status` and `workMode` are coerced to allowed values, with defaults `Applied` and `N/A`. Field lengths are capped at 5,000 characters, well under the 50,000-character limit for a cell.
-- **`setup()` is idempotent.** Running it again repairs the sheet without duplicating anything. It:
-  - Creates the `Applications` tab if it is missing, makes sure it has at least 1,001 rows, and rewrites the header row.
-  - Freezes row 1 and sets column widths and number formats.
-  - Re-applies data validation and replaces only its own status color rules (rules on other columns are kept).
-  - Creates the filter, or re-creates it over all rows if it is too short, keeping any active column criteria.
-  - Clears and rebuilds the `Summary` tab.
-  - Deletes every project trigger for `markGhosted` and re-creates the daily one (06:00 in the spreadsheet's time zone, via `inTimezone`) if `AUTO_GHOST` is true.
-- **Menu.** `onOpen()` adds a **Job Tracker** menu with **Run setup** and **Mark ghosted now**.
+- **Validation.** Company or Role must be present. `url` must parse as http(s). `status` and `workMode` are coerced to allowed values, with defaults `Applied` and `N/A`. Field lengths are capped at 5,000 characters, well under the 50,000-character limit for a cell.
+- **Applied Date.** Accepted only as a real `YYYY-MM-DD` calendar date; anything else becomes today in the browser's time zone.
+- **Formula-injection guard.** Because rows are written with `USER_ENTERED`, any string cell that starts with `=`, `+`, `-`, `@`, tab or CR is prefixed with `'`. This applies to every text field, including Notes.
+- **YOE stays text.** The YOE column has the plain-text number format, so `2-5 yrs` or `10-12` never become dates.
+- **Duplicate lookup.** Both the requested link and every Job Link cell are normalized (lower-cased, no scheme, `www.`, `#hash`, Workday locale, tracking parameters, `/apply` or trailing slash; remaining parameters sorted) and compared, newest row first. Links typed by hand still match.
+- **Concurrency.** Apps Script's lock is gone. `values.append` is atomic on Google's side, and one user saving from one browser doesn't race in practice.
 
 ---
 
@@ -517,23 +564,19 @@ Detection is cheap: no description parsing and no regex over the full body unles
 
 ## 8. Security and privacy
 
-- **Data goes only to the user's own sheet.** The extension makes no analytics calls, no telemetry, no remote config fetches and no third-party requests. The only outbound host is the user's own Web App on `script.google.com` / `script.googleusercontent.com`.
+- **Data goes only to the user's own Google account.** The extension makes no analytics calls, no telemetry, no remote config fetches and no third-party requests. The only hosts it calls are `sheets.googleapis.com` and `www.googleapis.com` (Sheets and Drive APIs), `accounts.google.com` through `chrome.identity` for sign-in, and `oauth2.googleapis.com/revoke` on disconnect.
+- **Least-privilege OAuth.** The only scope is `drive.file`: the extension can see and change only the files it created. It can't list or read any other file in the user's Drive. The full `spreadsheets` and `drive` scopes are never requested.
+- **Tokens.** In Chrome the browser's identity system stores and refreshes tokens. In other browsers the short-lived access token (about one hour) is kept in `chrome.storage.session`, which lives in memory and is never written to disk or synced. No refresh token exists. **Disconnect** revokes the grant.
 - **Minimal permissions.**
-  - `storage` holds the settings.
+  - `identity` for sign-in, `storage` for settings and the sheet ID, `alarms` for the daily upkeep.
   - `activeTab` and `scripting` are used for toolbar/shortcut injection on tabs without the content script.
-  - `host_permissions` cover only the two Google script hosts.
+  - `host_permissions` cover only the two Google API hosts.
   - The content scripts on `http://*/*` and `https://*/*` are required to detect jobs on any site. They make Chrome show the "read and change data on all websites" warning, and the README explains why.
-- **The content scripts make no network calls.** They only read the DOM and message the service worker.
+- **The content scripts make no network calls** and never see the token. They only read the DOM and message the service worker.
 - **Shadow DOM isolation.** A closed shadow root keeps page CSS out and stops page scripts from walking into the panel through `element.shadowRoot`.
-- **Formula injection.** The server prefixes any cell starting with `= + - @`, tab or CR with `'`. The client never builds formulas.
-- **Shared secret.** The optional `SECRET` stops random visitors who discover the Web App URL from writing rows. It is a shared token, not real authentication:
-  - It is stored in `chrome.storage.sync`, which syncs with the user's browser profile.
-  - It appears in GET query strings, which Google may log.
-  - Users should treat it as a low-value secret and pick a fresh random string.
-  - The service worker only sends it to a URL matching the Web App `/exec` shape (the same regex as the options page), so a mistyped or tampered setting can't leak it to another host.
-  - Without a secret, anyone with the URL can also call `ping` (spreadsheet name and row count) and `check` (whether a link is saved).
-- **Web App access "Anyone".** This is required because the extension calls it without Google cookies. The script runs as the sheet owner and only ever appends rows or reads the Job Link column.
-- **Input limits.** The server caps field lengths and coerces enums, so a hostile page can't push huge or invalid values through extracted fields.
+- **Formula injection.** The sheets layer prefixes any cell starting with `= + - @`, tab or CR with `'`. The client never builds formulas from page data.
+- **Input limits.** Field lengths are capped and enums coerced, so a hostile page can't push huge or invalid values through extracted fields.
+- **The sheet ID from `use-sheet`** must match `[\w-]+` and is checked with Drive before it is stored. With `drive.file`, Google itself refuses IDs of files the extension didn't create.
 - **Test fixtures are synthetic.** They are minimal hand-written HTML that mimics each site's structure. No real job posts or personal data are committed.
 
 ---
@@ -551,22 +594,20 @@ Detection is cheap: no description parsing and no regex over the full body unles
 - **Fixture tests (`extract.test.js`):** a table of `{ fixture, url, expected }` covering LinkedIn (including a search page with `currentJobId` and stale JSON-LD), Naukri, Indeed, Glassdoor, Greenhouse, Lever, Workday, Ashby, a **JSON-LD-only** page (malformed JSON inside `@graph`) and a **plain career page** that relies on heuristics only. Each test checks every field and `isLikelyJobPage`. A blog post fixture and LinkedIn's feed URL check that detection stays quiet on non-job pages.
   - Edge-case fixtures: Naukri with a `3-5 Yrs` chip, salary "Not disclosed", several location links, "remote teams" and "Founded 10 years ago" (`naukri-edge`); a Lever job in "Remote (India)" with the YOE in words (`lever-remote`); a Greenhouse embed on a company domain (`greenhouse-embed`); a page with no `h1` and Hybrid only in the description (`no-h1`); a Workday `/de-DE/` page with two locations (`workday-multi`); JSON-LD inside a comment with raw newlines, trailing commas and two locations next to an unrecoverable block (`jsonld-malformed`).
   - LinkedIn search and collection pages with `currentJobId`, and a ~1.2 MB description that must stay fast and respect the 50,000-character parsing cap.
-- **Apps Script tests (`apps-script.test.js`):** `Code.gs` is read as text and run with `node:vm` in a context that provides small in-memory mocks of `SpreadsheetApp` (a sheet backed by a 2D array, with `getRange`/`getValues`/`setValues`/`getLastRow`/`insertRowsAfter`; formatting calls are absorbed by a chainable proxy), `LockService`, `ContentService`, `ScriptApp` and `Utilities`. `Code.gs` contains no Node-specific code. The tests cover:
-  - Each `doGet`/`doPost` action and error code
-  - The token check, both enabled and disabled
-  - Formula-injection prefixing
-  - `onEdit` updating Last Updated only for Status edits
-  - `markGhosted` thresholds and `AUTO_GHOST = false`
-  - Row top-up when the pre-formatted rows run out
-  - Duplicate lookup by normalized link
-  - `setup()` idempotency: running it twice gives the same tabs, validation, rules and trigger count, and keeps the user's own rules
-  - Summary formulas wrapped for an empty sheet, the trigger's time zone, a 2,500-row duplicate lookup, Workday locale matching and rows without dates in `markGhosted`
-- **Sync test:** status colors and tracking parameters are duplicated across `Code.gs` (which can't import anything), `ui.js` and `extract.js`. A test compares the literal blocks so they can't drift apart.
+- **Sheets tests (`sheets.test.js`):** `config.js` and `lib/sheets.js` run in `node:vm` with a routed `fetch` mock, `chrome.identity`, `chrome.storage` and `navigator.userAgentData`. They cover:
+  - The exact request bodies for create → one batchUpdate → Drive tag: sheet IDs, header, frozen row, widths, dropdown values and strictness, the eight status colors, text and date formats, the filter range, and every Summary formula (including the empty-sheet `IFERROR` around `QUERY`)
+  - The `files.list` query
+  - Append: `USER_ENTERED`, the formula guard, YOE as text, defaults, validation, the row parsed from `updatedRange`, the `sheetUrl`, and the `insertDimension` top-up
+  - Duplicate lookup by normalized link, newest first, with the 60 s cache and cache updates after a save
+  - The 401 drop-and-retry-once, and 403/404/429/500/offline/signed-out error codes
+  - The `launchWebAuthFlow` fallback outside Google Chrome, with session caching, and revocation on sign-out
+  - `planUpkeep` (ghost thresholds, rows without dates, the on/off switch, snapshot-based stamping, links saved twice, cleared statuses) and `runUpkeep` (render options, one batch write, no snapshot update after a failed write)
+- **Sync test:** status colors and tracking parameters are duplicated across `lib/sheets.js`, `ui.js` and `extract.js`, and the client ID and scope across `config.js`, `lib/sheets.js` and `manifest.json`. A test compares them so they can't drift apart, and also pins the manifest's permission list.
 - **UI tests (`ui.test.js`):** `ui.js` runs in jsdom with a `chrome.*` mock; the closed shadow root is captured by wrapping `attachShadow`. They cover the open/duplicate/validate/save flow, error banners, the Google-Sheets-only link, Esc, key and focus isolation, focus return, late save replies, hiding a site, the single-instance handshake, and the detection budget per mode and URL.
-- **Options tests (`options.test.js`):** label association, loading settings, `/exec` URL validation, save-on-successful-test, the not-set-up warning, button mode and hidden sites.
-- **Service worker tests (`background.test.js`):** `background.js` runs in `node:vm` with `chrome.*` and `fetch` mocks. They check that the token goes only to a valid `/exec` URL (query for GET, body for POST), every reply-to-error mapping including `NOT_PUBLIC` detection, unknown messages, the options-page and badge fallbacks of the toolbar click, and that the URL regex matches the options page.
-- **Contract test:** every error code `Code.gs` can return must have a message in `background.js` and a row in the table in §6.
-- **Manual QA:** layout, real sites, real Google deployments and browser-specific behavior can't be faked well. [TESTING.md](TESTING.md) is the checklist to run before a release.
+- **Options tests (`options.test.js`):** label association, loading settings, the connect / choose existing / create new / connected / disconnect states, Reconnect after `SHEET_GONE`, a cancelled sign-in, the one-time legacy notice, the upkeep settings and their validation, button mode and hidden sites.
+- **Service worker tests (`background.test.js`):** `background.js` runs in `node:vm` with an `importScripts` that loads the real `config.js` and `lib/sheets.js`. They check the replies for every message, the friendly messages, that panel requests never sign in interactively, the connect flow (existing tracker, creation, removal of the legacy settings), status and disconnect, the toolbar fallbacks, and the alarm scheduling and run.
+- **Contract test:** every error code `lib/sheets.js` can raise must have a message in `background.js` and a row in the table in §6.
+- **Manual QA:** layout, real sites, real Google accounts and browser-specific behavior can't be faked well. [TESTING.md](TESTING.md) is the checklist to run before a release.
 
 ---
 
@@ -579,18 +620,30 @@ Each step landed as its own single-line conventional commit, in this order:
 | # | Step | Scope |
 |---|---|---|
 | 0 | Plan and repo | This document, LICENSE, .gitignore |
-| 1 | Apps Script backend | `Code.gs` (Web App API, setup, Summary, triggers, menu) and `appsscript.json` |
-| 2 | Extension shell | `manifest.json` and `background.js` (Web App client, error mapping, toolbar/shortcut, injection fallback, first-run options) |
+| 1 | Apps Script backend | `Code.gs` (Web App API, setup, Summary, triggers, menu) and `appsscript.json` (removed later) |
+| 2 | Extension shell | `manifest.json` and `background.js` |
 | 3 | Extractor | `extract.js`: site readers, JSON-LD, heuristics, field rules, detection |
 | 4 | In-page UI | `ui.js`: floating tab, Shadow DOM panel, duplicate warning, save flow, key isolation, SPA watcher, button modes |
-| 5 | Options page | URL and secret, connection test, button mode, hidden sites, shortcut |
+| 5 | Options page | Connection settings, button mode, hidden sites, shortcut |
 | 6 | Icons | `scripts/make-icons.js` and the generated PNGs |
-| 7 | Tests | `package.json`, fixtures, `fields`/`extract`/`apps-script` suites |
+| 7 | Tests | `package.json`, fixtures, test suites |
 | 8 | README | User-facing guide |
+
+### Built: direct Google Sheets access
+
+| # | Step | Scope |
+|---|---|---|
+| 1 | Sign-in config | `config.js`, `identity`/`alarms` permissions, `oauth2` with `drive.file` |
+| 2 | Sheets layer | `lib/sheets.js`: sign-in, create + one batchUpdate + Drive tag, append, lookup |
+| 3 | Service worker | Router on top of the sheets layer, connect/disconnect messages |
+| 4 | Daily upkeep | `chrome.alarms`: Auto-Ghosted and snapshot-based Last Updated |
+| 5 | Options page | Connect Google Sheets, choose existing, disconnect, upkeep settings, legacy notice |
+| 6 | Cleanup | Removed `apps-script/` and its tests |
+| 7 | Docs | README, this document, Google Cloud setup, publishing guide, privacy policy |
 
 ### Next
 
 - More site readers (SmartRecruiters, Workable, Wellfound, Instahyre) with fixtures, promoted from source-name mapping only.
-- A status-history tab so interview rate counts jobs that later moved to Rejected.
+- A status-history tab so interview rate counts jobs that later moved to Rejected (the upkeep snapshot already sees every status change).
 - Optional "Saved" quick action from the toolbar without opening the panel.
 - Firefox build (MV3 `background.scripts` fallback) once the Chrome version is stable.

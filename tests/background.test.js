@@ -222,9 +222,13 @@ test('the daily upkeep alarm is scheduled on install and startup and runs the up
   await offline.listeners.alarm({ name: 'daily-upkeep' }); // errors are swallowed
 });
 
-test('every code sheets.js can raise has a message', () => {
+test('every code sheets.js can raise has a message and is documented', () => {
   const sheets = read('extension/lib/sheets.js');
+  const docs = read('docs/ARCHITECTURE.md');
   const codes = new Set([...sheets.matchAll(/SheetsError\('([A-Z_]+)'/g), ...sheets.matchAll(/return '([A-Z_]+)';/g)].map((m) => m[1]));
   assert.deepEqual([...codes].sort(), ['BAD_REQUEST', 'BUSY', 'GOOGLE_ERROR', 'NETWORK', 'NOT_CONNECTED', 'SETUP_REQUIRED', 'SHEET_GONE', 'SIGNED_OUT']);
-  for (const code of codes) assert.match(CODE, new RegExp(`\\b${code}: ['"]`), `${code} message in background.js`);
+  for (const code of codes) {
+    assert.match(CODE, new RegExp(`\\b${code}: ['"]`), `${code} message in background.js`);
+    assert.match(docs, new RegExp(`\\| \`${code}\` \\| Sheets layer`), `${code} in ARCHITECTURE.md`);
+  }
 });
