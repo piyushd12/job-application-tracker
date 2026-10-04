@@ -199,6 +199,29 @@ test('toolbar click: options page when not connected, badge on pages that cannot
   assert.deepEqual(plain(env.calls.badge), [{ tabId: 7, text: '!' }]);
 });
 
+test('the daily upkeep alarm is scheduled on install and startup and runs the upkeep', async () => {
+  const env = makeEnv({
+    local: { spreadsheetId: 'sheet-1', statusSnapshot: {} },
+    sync: { autoGhost: false, ghostAfterDays: 'x' },
+    routes: [['GET', /values\/Applications!A2%3AL\?/, () => ({ values: [] })]],
+  });
+  env.listeners.installed({ reason: 'update' });
+  env.listeners.startup();
+  assert.deepEqual(plain(env.calls.alarms), [
+    ['daily-upkeep', { delayInMinutes: 1, periodInMinutes: 1440 }],
+    ['daily-upkeep', { delayInMinutes: 1, periodInMinutes: 1440 }],
+  ]);
+  assert.equal(env.calls.options, 0, 'options page only opens on first install');
+
+  await env.listeners.alarm({ name: 'something-else' });
+  assert.equal(env.calls.fetch.length, 0);
+  await env.listeners.alarm({ name: 'daily-upkeep' });
+  assert.equal(env.calls.fetch.length, 1, 'read the sheet');
+
+  const offline = makeEnv({ routes: [] });
+  await offline.listeners.alarm({ name: 'daily-upkeep' }); // errors are swallowed
+});
+
 test('every code sheets.js can raise has a message', () => {
   const sheets = read('extension/lib/sheets.js');
   const codes = new Set([...sheets.matchAll(/SheetsError\('([A-Z_]+)'/g), ...sheets.matchAll(/return '([A-Z_]+)';/g)].map((m) => m[1]));

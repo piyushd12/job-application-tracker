@@ -325,6 +325,105 @@ test('signOut revokes the token and clears caches', async () => {
   assert.equal(env.chrome.storage.session.data.linkCache, undefined);
 });
 
+// ----- Daily upkeep ---------------------------------------------------------
+
+const serial = (iso) => (Date.parse(iso) - Date.UTC(1899, 11, 30)) / 86400000;
+const TODAY = new Date(2026, 9, 4, 9, 30); // 04 Oct 2026, local time
+/** A row of Applications!A2:L with dates as serial numbers. */
+const upkeepRow = ({ status = 'Applied', link = '', applied = '', updated = '' } = {}) =>
+  ['Acme', 'Eng', applied, status, 'Remote', '', 'N/A', '', 'LinkedIn', link, updated, ''];
+
+test('planUpkeep ghosts stale Applied and OA rows only, using Last Updated then Applied Date', () => {
+  const { ctx } = makeEnv();
+  const old = serial('2026-08-01');
+  const recent = serial('2026-09-20');
+  const rows = [
+    upkeepRow({ status: 'Applied', updated: old }), // row 2: ghost
+    upkeepRow({ status: 'OA / Assessment', applied: old }), // row 3: no Last Updated, old Applied Date: ghost
+    upkeepRow({ status: 'Applied', applied: old, updated: recent }), // row 4: recent Last Updated wins
+    upkeepRow({ status: 'Interview', updated: old }), // row 5: not ghostable
+    upkeepRow({ status: 'Applied' }), // row 6: no dates at all
+    upkeepRow({ status: 'Applied', updated: 'not a date' }), // row 7
+    upkeepRow({ status: 'Applied', updated: serial('2026-09-03') }), // row 8: 31 days: ghost
+    upkeepRow({ status: 'Applied', updated: serial('2026-09-05') }), // row 9: 29 days: keep
+  ];
+  const { data } = plain(ctx.planUpkeep(rows, {}, { autoGhost: true, ghostAfterDays: 30, today: TODAY }));
+  assert.deepEqual(data, [
+    { range: 'Applications!D2', values: [['Ghosted']] }, { range: 'Applications!K2', values: [['2026-10-04']] },
+    { range: 'Applications!D3', values: [['Ghosted']] }, { range: 'Applications!K3', values: [['2026-10-04']] },
+    { range: 'Applications!D8', values: [['Ghosted']] }, { range: 'Applications!K8', values: [['2026-10-04']] },
+  ]);
+
+  assert.deepEqual(plain(ctx.planUpkeep(rows, {}, { autoGhost: false, ghostAfterDays: 30, today: TODAY }).data), [], 'switched off');
+  assert.equal(ctx.planUpkeep(rows, {}, { autoGhost: true, ghostAfterDays: 60, today: TODAY }).data.length, 4, 'threshold is configurable: only rows 2 and 3');
+});
+
+test('planUpkeep stamps Last Updated when a Status differs from the snapshot', () => {
+  const { ctx } = makeEnv();
+  const old = serial('2026-08-01');
+  const rows = [
+    upkeepRow({ status: 'Interview', link: 'https://a.com/1', updated: old }), // changed by hand
+    upkeepRow({ status: 'Applied', link: 'https://a.com/2', updated: serial('2026-10-01') }), // unchanged
+    upkeepRow({ status: 'Rejected', link: 'https://a.com/3', updated: old }), // new to the snapshot: just recorded
+    upkeepRow({ status: 'Applied', link: 'https://a.com/4', updated: old }), // Offer → Applied by hand: stamped, not ghosted
+    upkeepRow({ status: 'Applied', link: 'https://a.com/1', updated: serial('2026-10-01') }), // same link saved twice
+    upkeepRow({ status: '', link: 'https://a.com/5' }), // status cleared: not stamped
+  ];
+  const previous = { 'https://a.com/1': 'Applied', 'https://a.com/2': 'Applied', 'https://a.com/4': 'Offer', 'https://a.com/1 #2': 'Applied', 'https://a.com/5': 'Saved', 'https://gone.com': 'Applied' };
+  const { data, snapshot } = plain(ctx.planUpkeep(rows, previous, { autoGhost: true, ghostAfterDays: 30, today: TODAY }));
+  assert.deepEqual(data, [
+    { range: 'Applications!K2', values: [['2026-10-04']] },
+    { range: 'Applications!K5', values: [['2026-10-04']] },
+  ]);
+  assert.deepEqual(snapshot, {
+    'https://a.com/1': 'Interview', 'https://a.com/2': 'Applied', 'https://a.com/3': 'Rejected',
+    'https://a.com/4': 'Applied', 'https://a.com/1 #2': 'Applied', 'https://a.com/5': '',
+  }, 'deleted rows drop out');
+});
+
+test('runUpkeep reads serial dates, writes one batch and saves the snapshot afterwards', async () => {
+  const old = serial('2026-08-01');
+  const env = makeEnv({
+    local: { spreadsheetId: ID, statusSnapshot: { 'https://a.com/1': 'Applied' } },
+    routes: [
+      ['GET', /values\/Applications!A2%3AL\?/, () => ({ values: [upkeepRow({ status: 'Offer', link: 'https://a.com/1' }), upkeepRow({ link: 'https://a.com/2', updated: old })] })],
+      ['POST', /values:batchUpdate$/, () => ({})],
+    ],
+  });
+  assert.equal(await env.ctx.runUpkeep({ autoGhost: true, ghostAfterDays: 30 }), 3);
+  const read = new URL(env.calls.fetch[0].url);
+  assert.equal(read.searchParams.get('valueRenderOption'), 'UNFORMATTED_VALUE');
+  assert.equal(read.searchParams.get('dateTimeRenderOption'), 'SERIAL_NUMBER');
+  const write = env.calls.fetch[1].body;
+  assert.equal(write.valueInputOption, 'USER_ENTERED');
+  assert.deepEqual(write.data.map((d) => d.range), ['Applications!K2', 'Applications!D3', 'Applications!K3']);
+  assert.deepEqual(plain(env.chrome.storage.local.data.statusSnapshot), { 'https://a.com/1': 'Offer', 'https://a.com/2': 'Ghosted' });
+
+  // A failed write keeps the old snapshot, so the change is found again next time.
+  const retry = makeEnv({
+    local: { spreadsheetId: ID, statusSnapshot: { 'https://a.com/1': 'Applied' } },
+    routes: [
+      ['GET', /values\/Applications!A2%3AL\?/, () => ({ values: [upkeepRow({ status: 'Offer', link: 'https://a.com/1' })] })],
+      ['POST', /values:batchUpdate$/, () => ({ status: 500, body: {} })],
+    ],
+  });
+  await assert.rejects(retry.ctx.runUpkeep({}), { code: 'GOOGLE_ERROR' });
+  assert.deepEqual(retry.chrome.storage.local.data.statusSnapshot, { 'https://a.com/1': 'Applied' });
+
+  const idle = makeEnv({ local: {} });
+  assert.equal(await idle.ctx.runUpkeep({}), 0, 'nothing to do before connecting');
+  assert.equal(idle.calls.fetch.length, 0);
+});
+
+test('a saved job is added to the snapshot, so a later manual change is noticed', async () => {
+  const env = makeEnv({
+    local: { spreadsheetId: ID, statusSnapshot: { 'https://acme.com/jobs/1': 'Rejected' } },
+    routes: [['GET', ...SHEET_PROPS], ['POST', /:append\?/, () => ({ updates: { updatedRange: 'Applications!A9:L9' } })]],
+  });
+  await env.ctx.appendJob(JOB);
+  assert.deepEqual(env.chrome.storage.local.data.statusSnapshot, { 'https://acme.com/jobs/1': 'Rejected', 'https://acme.com/jobs/1 #2': 'Interview' });
+});
+
 // ----- Kept in sync with other files ----------------------------------------
 
 test('sheets.js agrees with the content scripts and the manifest', () => {

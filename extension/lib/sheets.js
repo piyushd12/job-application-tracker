@@ -46,11 +46,14 @@ const STATUS_COLORS = {
   'Withdrawn': ['#e6d5c3', '#6d4c2f'],
 };
 const WORK_MODES = ['On-site', 'Remote', 'Hybrid', 'N/A'];
+const GHOSTABLE_STATUSES = ['Applied', 'OA / Assessment'];
 
 const PREFORMATTED_ROWS = 1000;
 const MIN_FREE_ROWS = 50;
 const TOP_UP_ROWS = 500;
 const MAX_FIELD_LENGTH = 5000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const SERIAL_EPOCH = Date.UTC(1899, 11, 30); // day 0 of spreadsheet date serial numbers
 
 /** Query parameters ignored when comparing job links. Keep in sync with extension/content/extract.js. */
 const TRACKING_PARAMS = [
@@ -214,8 +217,7 @@ async function trackerId() {
 }
 
 async function useTracker(id) {
-  await chrome.storage.local.set({ spreadsheetId: id });
-  await chrome.storage.local.remove('statusSnapshot');
+  await chrome.storage.local.set({ spreadsheetId: id, statusSnapshot: {} });
   await chrome.storage.session.remove('linkCache');
 }
 
@@ -302,13 +304,19 @@ function topUpRows(id, sheet, row) {
   }]);
 }
 
-/** Keeps the cached link column current after a save. */
+/** Keeps the cached link column current after a save, and records the row's status for the daily upkeep. */
 async function rememberSavedRow(id, row, values) {
+  const link = values[COL.link - 1];
   const { linkCache } = await chrome.storage.session.get('linkCache');
   if (linkCache && linkCache.id === id) {
-    linkCache.links[row - 2] = values[COL.link - 1];
+    linkCache.links[row - 2] = link;
     await chrome.storage.session.set({ linkCache });
   }
+  const { statusSnapshot = {} } = await chrome.storage.local.get('statusSnapshot');
+  let n = 0;
+  while (Object.hasOwn(statusSnapshot, snapshotKey(link, n))) n++;
+  statusSnapshot[snapshotKey(link, n)] = values[COL.status - 1];
+  await chrome.storage.local.set({ statusSnapshot });
 }
 
 /** The Job Link column, cached briefly so opening the panel on several jobs doesn't re-read it each time. */
@@ -340,6 +348,75 @@ async function findByLink(url) {
     };
   }
   return { found: false };
+}
+
+// ----- Daily upkeep (run from a chrome.alarms alarm) ---------------------------
+
+/**
+ * Marks stale rows Ghosted and stamps Last Updated after a manual Status change. Status changes are
+ * found by comparing every row with the snapshot taken on the previous run. The snapshot is saved only
+ * after the sheet was written, so a failed run is retried in full next time.
+ */
+async function runUpkeep(settings) {
+  const { spreadsheetId: id, statusSnapshot = {} } = await chrome.storage.local.get(['spreadsheetId', 'statusSnapshot']);
+  if (!id) return 0;
+  const res = await google(valuesUrl(id, `${SHEET_NAME}!A2:L`, '?valueRenderOption=UNFORMATTED_VALUE&dateTimeRenderOption=SERIAL_NUMBER'));
+  const { data, snapshot } = planUpkeep(res.values || [], statusSnapshot, settings);
+  if (data.length) {
+    await google(`${SHEETS_API}/${id}/values:batchUpdate`, { method: 'POST', body: { valueInputOption: 'USER_ENTERED', data } });
+  }
+  await chrome.storage.local.set({ statusSnapshot: snapshot });
+  return data.length;
+}
+
+/**
+ * Pure: the cell writes for one upkeep run, and the next snapshot. rows are Applications!A2:L as
+ * unformatted values, so dates are serial numbers.
+ * - A Status that differs from the snapshot was changed by hand: Last Updated becomes today.
+ * - Otherwise an Applied or OA / Assessment row whose Last Updated (or Applied Date) is older than
+ *   ghostAfterDays becomes Ghosted, and Last Updated becomes today. Rows without a date are left alone.
+ */
+function planUpkeep(rows, previous, { autoGhost = true, ghostAfterDays = 30, today = new Date() } = {}) {
+  const todayIso = isoDate(today);
+  const cutoff = toSerial(todayIso) - ghostAfterDays;
+  const seen = {};
+  const snapshot = {};
+  const data = [];
+  rows.forEach((cells, i) => {
+    const row = i + 2;
+    const link = cellText(cells[COL.link - 1]);
+    let status = cellText(cells[COL.status - 1]);
+    let key = '';
+    if (link) {
+      seen[link] = (seen[link] || 0) + 1;
+      key = snapshotKey(link, seen[link] - 1);
+    }
+    let stamp = Boolean(key && status && Object.hasOwn(previous, key) && previous[key] !== status);
+    if (!stamp && autoGhost && GHOSTABLE_STATUSES.includes(status)) {
+      const last = toSerial(cells[COL.updated - 1]) || toSerial(cells[COL.applied - 1]);
+      if (last && last < cutoff) {
+        status = 'Ghosted';
+        data.push({ range: `${SHEET_NAME}!D${row}`, values: [[status]] });
+        stamp = true;
+      }
+    }
+    if (stamp) data.push({ range: `${SHEET_NAME}!K${row}`, values: [[todayIso]] });
+    if (key) snapshot[key] = status;
+  });
+  return { data, snapshot };
+}
+
+/** Snapshot key for the nth row (0-based) with this Job Link, so a job saved twice keeps two entries. */
+// ponytail: keyed by link and position; deleting one of several rows with the same link can stamp the other once.
+function snapshotKey(link, n) {
+  return n ? `${link} #${n + 1}` : link;
+}
+
+/** A spreadsheet date serial number from a serial, or from a date typed as text. 0 when there is none. */
+function toSerial(value) {
+  if (typeof value === 'number') return value;
+  const time = typeof value === 'string' && value ? Date.parse(value) : NaN;
+  return Number.isNaN(time) ? 0 : (time - SERIAL_EPOCH) / DAY_MS;
 }
 
 // ----- Rows ---------------------------------------------------------------

@@ -7,6 +7,8 @@ importScripts('config.js', 'lib/sheets.js');
 
 const CONTENT_SCRIPTS = ['content/extract.js', 'content/ui.js'];
 const LEGACY_SETTINGS = ['webAppUrl', 'secret'];
+const UPKEEP_ALARM = 'daily-upkeep';
+const UPKEEP_DEFAULTS = { autoGhost: true, ghostAfterDays: 30 };
 const UNSUPPORTED_PAGE_TITLE = "Can't save from this page: browser pages, the Chrome Web Store and local files are off-limits to extensions.";
 
 const ERROR_MESSAGES = {
@@ -24,10 +26,39 @@ const ERROR_MESSAGES = {
 // ----- Lifecycle, toolbar and shortcut ------------------------------------
 
 chrome.runtime.onInstalled.addListener(({ reason }) => {
+  scheduleUpkeep();
   if (reason === chrome.runtime.OnInstalledReason.INSTALL) {
     chrome.runtime.openOptionsPage().catch(() => {});
   }
 });
+
+chrome.runtime.onStartup.addListener(scheduleUpkeep);
+
+// ----- Daily upkeep: Auto-Ghosted and Last Updated ------------------------
+
+// Alarms may not survive a browser restart, so the alarm is re-created on every start. Its first run,
+// a minute later, catches up on the days the browser was closed; after that it runs once a day.
+function scheduleUpkeep() {
+  chrome.alarms.create(UPKEEP_ALARM, { delayInMinutes: 1, periodInMinutes: 24 * 60 });
+}
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === UPKEEP_ALARM) return upkeep();
+});
+
+async function upkeep() {
+  try {
+    const settings = await chrome.storage.sync.get(UPKEEP_DEFAULTS);
+    const days = Math.round(Number(settings.ghostAfterDays));
+    await runUpkeep({
+      autoGhost: settings.autoGhost !== false,
+      ghostAfterDays: days >= 1 && days <= 365 ? days : UPKEEP_DEFAULTS.ghostAfterDays,
+    });
+  } catch (err) {
+    // Not connected, signed out or offline: the next run tries again.
+    console.warn('Daily upkeep skipped:', (err && err.code) || err);
+  }
+}
 
 // Fired by the toolbar icon and by the _execute_action command (Alt+Shift+J).
 chrome.action.onClicked.addListener((tab) => {
