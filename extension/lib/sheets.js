@@ -156,10 +156,10 @@ async function signOut() {
 
 // ----- REST ---------------------------------------------------------------
 
-/** Calls a Google API with the user's token. A 401 drops the cached token and retries once. */
-async function google(url, { method = 'GET', body, interactive = false } = {}) {
+/** Calls a Google API with a silent token (connect signs in first). A 401 drops the cached token and retries once. */
+async function google(url, { method = 'GET', body } = {}) {
   for (let attempt = 0; ; attempt++) {
-    const token = await getToken(interactive);
+    const token = await getToken(false);
     const init = { method, headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(GOOGLE_TIMEOUT_MS) };
     if (body !== undefined) {
       init.headers['Content-Type'] = 'application/json';
