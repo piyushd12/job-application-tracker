@@ -1,26 +1,24 @@
 'use strict';
 
-// Service worker: the only place that talks to the network. Content scripts and the
-// options page send it messages; it calls the user's Apps Script Web App and replies.
+// Service worker: the only place that talks to the network. Content scripts and the options page
+// send it messages; it calls Google Sheets and Drive through lib/sheets.js and replies.
 
-const DEFAULT_SETTINGS = { webAppUrl: '', secret: '', buttonMode: 'auto', hiddenSites: [] };
+importScripts('config.js', 'lib/sheets.js');
+
 const CONTENT_SCRIPTS = ['content/extract.js', 'content/ui.js'];
-const REQUEST_TIMEOUT_MS = 20000;
-/** Keep in sync with WEB_APP_URL_RE in options/options.js. The token is only ever sent to a URL of this shape. */
-const WEB_APP_URL_RE = /^https:\/\/script\.google\.com\/(?:a\/macros\/[^/]+\/|macros\/)s\/[\w-]+\/exec$/;
+const LEGACY_SETTINGS = ['webAppUrl', 'secret'];
 const UNSUPPORTED_PAGE_TITLE = "Can't save from this page: browser pages, the Chrome Web Store and local files are off-limits to extensions.";
 
 const ERROR_MESSAGES = {
-  NOT_CONFIGURED: 'Add your Web App URL in Settings first.',
-  NOT_PUBLIC: 'Google returned a sign-in page. Redeploy the Web App with "Who has access: Anyone".',
+  NOT_CONNECTED: 'Connect Google Sheets in Settings first.',
+  SIGNED_OUT: 'Google sign-in is needed. Open Settings and click Connect Google Sheets.',
+  SHEET_GONE: "Can't open your tracker sheet. It may have been deleted, or access was removed. Open Settings and click Reconnect.",
+  SETUP_REQUIRED: 'Your tracker sheet has no "Applications" tab. Rename it back, or open Settings and click Reconnect to create a new sheet.',
+  BUSY: 'Google Sheets is busy. Try again in a moment.',
   NETWORK: "Couldn't reach Google. Check your connection and try again.",
-  BAD_RESPONSE: 'Unexpected reply from the Web App. Make sure the URL is the one ending in /exec.',
-  BAD_TOKEN: "The secret doesn't match the SECRET in Code.gs.",
+  GOOGLE_ERROR: 'Google Sheets returned an error. Try again in a moment.',
   BAD_REQUEST: 'The job data was rejected.',
-  UNKNOWN_ACTION: "The extension and Code.gs don't match. Paste the latest Code.gs and redeploy.",
-  SETUP_REQUIRED: "The sheet isn't set up yet. In the sheet, choose Job Tracker → Run setup.",
-  LOCK_TIMEOUT: 'The sheet is busy. Try again in a moment.',
-  INTERNAL: 'Something went wrong in the script. Check Executions in the Apps Script editor.',
+  INTERNAL: 'Something went wrong in the extension. Try again.',
 };
 
 // ----- Lifecycle, toolbar and shortcut ------------------------------------
@@ -37,8 +35,8 @@ chrome.action.onClicked.addListener((tab) => {
 });
 
 async function openPanel(tab) {
-  const { webAppUrl } = await getSettings();
-  if (!webAppUrl) {
+  const { spreadsheetId } = await chrome.storage.local.get('spreadsheetId');
+  if (!spreadsheetId) {
     await chrome.runtime.openOptionsPage();
     return;
   }
@@ -79,9 +77,32 @@ async function sendToTab(tabId, message) {
 // ----- Message router -----------------------------------------------------
 
 const HANDLERS = {
-  'add-job': async ({ job }) => callWebApp(await getSettings(), { method: 'POST', body: { action: 'add', job } }),
-  'check-duplicate': async ({ url }) => callWebApp(await getSettings(), { params: { action: 'check', url } }),
-  'ping': ({ webAppUrl, secret }) => callWebApp({ webAppUrl, secret }, { params: { action: 'ping' } }),
+  'add-job': async ({ job }) => ({ ok: true, ...(await appendJob(job)) }),
+  'check-duplicate': async ({ url }) => ({ ok: true, ...(await findByLink(url)) }),
+
+  // Options page. Only "connect" may show Google's consent screen: it runs right after a click.
+  'status': async () => {
+    const { spreadsheetId } = await chrome.storage.local.get('spreadsheetId');
+    if (!spreadsheetId) return { ok: true, connected: false };
+    return { ok: true, connected: true, sheet: await getTrackerInfo(spreadsheetId) };
+  },
+  'connect': async () => {
+    await getToken(true);
+    const existing = await findExistingTracker();
+    if (existing) return { ok: true, existing };
+    return connected(await createTrackerSpreadsheet());
+  },
+  'use-sheet': async ({ id }) => {
+    if (!/^[\w-]+$/.test(String(id || ''))) return failure('BAD_REQUEST');
+    return connected(await getTrackerInfo(id));
+  },
+  'create-sheet': async () => connected(await createTrackerSpreadsheet()),
+  'disconnect': async () => {
+    await signOut();
+    await forgetTracker();
+    return { ok: true };
+  },
+
   'open-options': async () => {
     await chrome.runtime.openOptionsPage();
     return { ok: true };
@@ -93,94 +114,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!handler) return false;
   handler(message, sender)
     .then(sendResponse)
-    .catch(() => sendResponse(failure('INTERNAL')));
+    .catch((err) => sendResponse(ERROR_MESSAGES[err && err.code] ? failure(err.code, err.detail) : failure('INTERNAL')));
   return true; // keep the channel open for the async reply
 });
 
-async function getSettings() {
-  return chrome.storage.sync.get(DEFAULT_SETTINGS);
-}
-
-// ----- Web App client -----------------------------------------------------
-
-/**
- * Calls the Apps Script Web App. GET puts parameters in the query string; POST sends JSON
- * as text/plain so the browser skips the CORS preflight that Apps Script can't answer.
- */
-async function callWebApp({ webAppUrl, secret }, { method = 'GET', params = {}, body = {} }) {
-  const base = parseWebAppUrl(webAppUrl);
-  if (!base) return failure('NOT_CONFIGURED');
-  const token = secret || '';
-
-  const url = new URL(base);
-  const init = { credentials: 'omit', redirect: 'follow', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) };
-  if (method === 'GET') {
-    for (const [key, value] of Object.entries({ ...params, token })) url.searchParams.set(key, value ?? '');
-  } else {
-    init.method = 'POST';
-    init.headers = { 'Content-Type': 'text/plain;charset=utf-8' };
-    init.body = JSON.stringify({ ...body, token });
-  }
-
-  let response;
-  try {
-    response = await fetch(url, init);
-  } catch (err) {
-    if (err && err.name === 'TimeoutError') return failure('NETWORK');
-    return failure((await redirectsAway(base)) ? 'NOT_PUBLIC' : 'NETWORK');
-  }
-  return readResponse(response);
-}
-
-function parseWebAppUrl(value) {
-  const url = String(value || '').trim();
-  return WEB_APP_URL_RE.test(url) ? url : null;
+async function connected(sheet) {
+  await useTracker(sheet.id);
+  await chrome.storage.sync.remove(LEGACY_SETTINGS);
+  return { ok: true, sheet };
 }
 
 /**
- * A Web App that isn't shared with "Anyone" redirects to accounts.google.com. We have no host
- * permission there, so the followed fetch fails like a network error. A second request that
- * doesn't follow redirects tells the two apart: a reachable server answers with a redirect.
+ * message is what the panel and options page show. detail is Google's own wording (the options page adds it),
+ * except for BAD_REQUEST, whose detail is our own validation text and part of the message.
  */
-async function redirectsAway(url) {
-  try {
-    const res = await fetch(url, { credentials: 'omit', redirect: 'manual', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
-    return res.type === 'opaqueredirect';
-  } catch {
-    return false;
-  }
-}
-
-async function readResponse(response) {
-  let text;
-  try {
-    text = await response.text();
-  } catch {
-    return failure('NETWORK');
-  }
-  if (isSignInPage(response.url, text)) return failure('NOT_PUBLIC');
-
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    return failure('BAD_RESPONSE');
-  }
-  if (!data || typeof data.ok !== 'boolean') return failure('BAD_RESPONSE');
-  if (data.ok) return data;
-  return failure(ERROR_MESSAGES[data.error] ? data.error : 'INTERNAL', data.message);
-}
-
-function isSignInPage(responseUrl, text) {
-  try {
-    if (new URL(responseUrl).hostname === 'accounts.google.com') return true;
-  } catch {
-    // No final URL; fall through to the body check.
-  }
-  return /^\s*</.test(text) && /accounts\.google\.com|ServiceLogin/i.test(text);
-}
-
-function failure(code, detail) {
-  const message = detail ? `${ERROR_MESSAGES[code]} ${detail}` : ERROR_MESSAGES[code];
-  return { ok: false, error: code, message };
+function failure(code, detail = '') {
+  const message = code === 'BAD_REQUEST' && detail ? `${ERROR_MESSAGES[code]} ${detail}` : ERROR_MESSAGES[code];
+  return { ok: false, error: code, message, detail };
 }

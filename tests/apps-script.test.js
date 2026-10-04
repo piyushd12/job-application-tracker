@@ -406,18 +406,6 @@ test('markGhosted does nothing when AUTO_GHOST is off', () => {
   assert.equal(env.sheet().cell(2, STATUS), 'Applied');
 });
 
-test('every server error code has a client message and is documented', () => {
-  const read = (file) => fs.readFileSync(path.join(__dirname, '..', file), 'utf8');
-  const background = read('extension/background.js');
-  const docs = read('docs/ARCHITECTURE.md');
-  const codes = [...new Set([...CODE.matchAll(/fail_\('([A-Z_]+)'/g)].map((m) => m[1]))];
-  assert.deepEqual(codes.sort(), ['BAD_REQUEST', 'BAD_TOKEN', 'INTERNAL', 'LOCK_TIMEOUT', 'SETUP_REQUIRED', 'UNKNOWN_ACTION']);
-  for (const code of codes) {
-    assert.match(background, new RegExp(`\\b${code}: ['"]`), `${code} message in background.js`);
-    assert.match(docs, new RegExp(`\\| \`${code}\` \\| Apps Script`), `${code} in ARCHITECTURE.md`);
-  }
-});
-
 test('Code.gs and the extension agree on status colors and tracking parameters', () => {
   const read = (file) => fs.readFileSync(path.join(__dirname, '..', file), 'utf8');
   const block = (source, name) => {
