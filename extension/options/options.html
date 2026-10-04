@@ -32,18 +32,22 @@
     .field { margin-bottom: 14px; }
     .field > label { display: block; margin-bottom: 4px; font-size: 13px; font-weight: 600; }
     .help { display: block; margin-top: 4px; color: var(--muted); font-size: 13px; }
-    input[type="url"], input[type="password"], input[type="text"] {
-      width: 100%; padding: 9px 11px; font: inherit; color: inherit; background: var(--field);
+    input[type="number"] {
+      width: 7em; padding: 9px 11px; font: inherit; color: inherit; background: var(--field);
       border: 1px solid var(--field-border); border-radius: 8px;
     }
-    input:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+    input:focus-visible, button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
     [aria-invalid="true"] { border-color: var(--danger) !important; }
-    .secret-row { display: flex; gap: 8px; }
-    .secret-row input { flex: 1; min-width: 0; }
     .actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-    button { padding: 9px 16px; border-radius: 8px; font: 600 14px/1.2 inherit; cursor: pointer; }
-    button.primary { border: 0; background: var(--accent); color: var(--accent-fg); }
+    button, a.button { display: inline-block; padding: 9px 16px; border-radius: 8px; font: 600 14px/1.2 inherit; cursor: pointer; text-decoration: none; }
+    button.primary, a.button.primary { border: 0; background: var(--accent); color: var(--accent-fg); }
     button.secondary { border: 1px solid var(--border); background: transparent; color: var(--fg); }
+    button.big { padding: 12px 22px; font-size: 15px; }
+    .connected { margin: 0 0 14px; font-size: 15px; }
+    .connected .tick { color: var(--ok); font-weight: 700; }
+    .check { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; font-size: 14px; font-weight: 600; cursor: pointer; }
+    .check input { width: 18px; height: 18px; margin: 0; accent-color: var(--accent); }
+    .notice { margin: 0 0 16px; }
     button:disabled { opacity: .6; cursor: progress; }
     .status { margin: 14px 0 0; padding: 10px 12px; border-radius: 10px; font-size: 14px; }
     .status.ok { background: var(--ok-bg); color: var(--ok); }
@@ -82,28 +86,43 @@
     </header>
 
     <section aria-labelledby="connect-title">
-      <h2 id="connect-title">Connect your sheet</h2>
-      <p class="lead">Deploy <code>Code.gs</code> as a Web App from your sheet, then paste its URL here. <a href="https://github.com/piyushd12/job-application-tracking-extension#installation" target="_blank" rel="noopener noreferrer">Setup guide</a></p>
-      <form id="connection-form" novalidate>
-        <div class="field">
-          <label for="web-app-url">Web App URL</label>
-          <input id="web-app-url" type="url" placeholder="https://script.google.com/macros/s/…/exec" autocomplete="off" spellcheck="false" required aria-describedby="web-app-url-help">
-          <small id="web-app-url-help" class="help">In Apps Script: Deploy → Manage deployments → copy the Web app URL (it ends in <code>/exec</code>).</small>
-        </div>
-        <div class="field">
-          <label for="secret">Secret (optional)</label>
-          <div class="secret-row">
-            <input id="secret" type="password" autocomplete="off" spellcheck="false" aria-describedby="secret-help">
-            <button id="toggle-secret" class="secondary" type="button" aria-pressed="false" aria-label="Show secret">Show</button>
-          </div>
-          <small id="secret-help" class="help">Only needed if you set <code>SECRET</code> in Code.gs. Both values must match.</small>
-        </div>
+      <h2 id="connect-title">Google Sheets</h2>
+      <p id="legacy-notice" class="status warn notice" role="status" hidden>The extension no longer uses an Apps Script Web App, so your old Web App URL and secret were removed. Click <strong>Connect Google Sheets</strong> to continue. Your old sheet stays as it is in your Drive.</p>
+
+      <div id="state-disconnected">
+        <p class="lead">Sign in with Google and the extension creates a ready-to-use "Job Applications Tracker" spreadsheet in your Drive. It can only see the spreadsheets it creates.</p>
+        <button id="connect" class="primary big" type="button">Connect Google Sheets</button>
+      </div>
+
+      <div id="state-choose" hidden>
+        <p class="lead tight">You already have a tracker sheet created by this extension: <strong id="existing-name"></strong></p>
         <div class="actions">
-          <button class="primary" type="submit">Save</button>
-          <button id="test-connection" class="secondary" type="button">Test connection</button>
+          <button id="use-existing" class="primary" type="button">Use existing sheet</button>
+          <button id="create-new" class="secondary" type="button">Create new</button>
         </div>
-        <p id="connection-status" class="status" role="status" hidden></p>
-      </form>
+      </div>
+
+      <div id="state-connected" hidden>
+        <p class="connected"><span class="tick" aria-hidden="true">✓</span> Connected to <strong id="sheet-name"></strong></p>
+        <div class="actions">
+          <a id="open-sheet" class="button primary" href="https://docs.google.com/spreadsheets/" target="_blank" rel="noopener noreferrer">Open sheet</a>
+          <button id="disconnect" class="secondary" type="button">Disconnect</button>
+        </div>
+      </div>
+
+      <p id="connection-status" class="status" role="status" hidden></p>
+    </section>
+
+    <section aria-labelledby="upkeep-title">
+      <h2 id="upkeep-title">Automatic upkeep</h2>
+      <p class="lead">Once a day the extension sets <em>Last Updated</em> on rows whose Status you changed, and can mark applications with no movement as <strong>Ghosted</strong>. It runs while the browser is open, and catches up shortly after the next start if the browser was closed.</p>
+      <label class="check"><input id="auto-ghost" type="checkbox"> Mark Applied and OA / Assessment rows as Ghosted</label>
+      <div class="field">
+        <label for="ghost-days">After this many days without a change</label>
+        <input id="ghost-days" type="number" min="1" max="365" step="1" inputmode="numeric" aria-describedby="ghost-days-help">
+        <small id="ghost-days-help" class="help">Between 1 and 365. The default is 30.</small>
+      </div>
+      <span id="upkeep-saved" class="saved-note" role="status"></span>
     </section>
 
     <section aria-labelledby="button-title">

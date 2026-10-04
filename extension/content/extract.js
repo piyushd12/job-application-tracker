@@ -201,7 +201,7 @@
 
   // ===== Canonical URL =====================================================
 
-  /** Keep in sync with TRACKING_PARAMS in apps-script/Code.gs. */
+  /** Keep in sync with TRACKING_PARAMS in extension/lib/sheets.js. */
   const TRACKING_PARAMS = new Set([
     'ref', 'refid', 'ref_src', 'referrer', 'trk', 'trkinfo', 'trackingid', 'gh_src',
     'lever-source', 'lever-origin', 'fbclid', 'gclid', 'dclid', 'msclkid', 'yclid',

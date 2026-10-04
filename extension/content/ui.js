@@ -19,7 +19,7 @@
   const Extract = globalThis.JobExtract;
   if (!Extract || !isExtensionAlive() || !(document.documentElement instanceof HTMLElement)) return;
 
-  /** [background, text] per status. Keep in sync with STATUS_COLORS in apps-script/Code.gs. */
+  /** [background, text] per status. Keep in sync with STATUS_COLORS in lib/sheets.js. */
   const STATUS_COLORS = {
     'Saved': ['#f1f3f4', '#3c4043'],
     'Applied': ['#d2e3fc', '#174ea6'],
@@ -33,7 +33,7 @@
   const WORK_MODES = ['On-site', 'Remote', 'Hybrid', 'N/A'];
   const EXTRA_SOURCES = ['Referral', 'Recruiter', 'Email'];
   const FIELDS = ['company', 'role', 'appliedDate', 'status', 'workMode', 'location', 'yoe', 'salary', 'source', 'url', 'notes'];
-  const DEFAULT_SETTINGS = { webAppUrl: '', buttonMode: 'auto', hiddenSites: [] };
+  const DEFAULT_SETTINGS = { buttonMode: 'auto', hiddenSites: [] };
   const DETECT_DEBOUNCE_MS = 500;
   const DETECT_MAX_WAIT_MS = 2000;
   // Enough for a slow SPA to render its content; after that the same URL is not re-checked.

@@ -17,7 +17,7 @@ const tick = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
 function mount({ html = fixture('greenhouse.html'), url = 'https://job-boards.greenhouse.io/acmerobotics/jobs/4567890', settings = {}, fastTimers = false } = {}) {
   const dom = new JSDOM(html, { url, runScripts: 'outside-only', pretendToBeVisual: true });
   const w = dom.window;
-  const storage = { webAppUrl: 'https://script.google.com/macros/s/x/exec', buttonMode: 'auto', hiddenSites: [], ...settings };
+  const storage = { buttonMode: 'auto', hiddenSites: [], ...settings };
   const sent = [];
   const env = { w, storage, sent, shadows: [], onMessage: [], replies: {} };
   env.replies['check-duplicate'] = { ok: true, found: false };
@@ -102,13 +102,13 @@ test('panel opens pre-filled, warns about duplicates and saves', async () => {
 
 test('errors from the service worker are shown and only Google Sheets links are offered', async () => {
   const env = mount();
-  env.replies['check-duplicate'] = { ok: false, error: 'BAD_TOKEN', message: "The secret doesn't match." };
+  env.replies['check-duplicate'] = { ok: false, error: 'SHEET_GONE', message: "Can't open your tracker sheet." };
   env.replies['add-job'] = { ok: true, row: 3, sheetUrl: 'https://evil.example/' };
   await tick();
   env.openPanel();
   await tick();
   assert.equal(env.$('.banner.error').hidden, false);
-  assert.equal(env.$('.error-text').textContent, "The secret doesn't match.");
+  assert.equal(env.$('.error-text').textContent, "Can't open your tracker sheet.");
   env.$('form').requestSubmit();
   await tick();
   assert.equal(env.$('.open-sheet').hidden, true);

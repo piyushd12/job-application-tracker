@@ -1,16 +1,27 @@
 'use strict';
 
-const DEFAULT_SETTINGS = { webAppUrl: '', secret: '', buttonMode: 'auto', hiddenSites: [] };
-const WEB_APP_URL_RE = /^https:\/\/script\.google\.com\/(?:a\/macros\/[^/]+\/|macros\/)s\/[\w-]+\/exec$/;
+const DEFAULT_SETTINGS = { buttonMode: 'auto', hiddenSites: [], autoGhost: true, ghostAfterDays: 30 };
+/** Settings of the old Apps Script version. */
+const LEGACY_SETTINGS = { webAppUrl: '', secret: '' };
+const RECONNECT_ERRORS = ['SHEET_GONE', 'SIGNED_OUT', 'SETUP_REQUIRED'];
 
 const $ = (id) => document.getElementById(id);
 const els = {
-  form: $('connection-form'),
-  url: $('web-app-url'),
-  secret: $('secret'),
-  toggleSecret: $('toggle-secret'),
-  test: $('test-connection'),
+  legacyNotice: $('legacy-notice'),
+  stateDisconnected: $('state-disconnected'),
+  stateChoose: $('state-choose'),
+  stateConnected: $('state-connected'),
+  connect: $('connect'),
+  existingName: $('existing-name'),
+  useExisting: $('use-existing'),
+  createNew: $('create-new'),
+  sheetName: $('sheet-name'),
+  openSheet: $('open-sheet'),
+  disconnect: $('disconnect'),
   status: $('connection-status'),
+  autoGhost: $('auto-ghost'),
+  ghostDays: $('ghost-days'),
+  upkeepSaved: $('upkeep-saved'),
   modeSaved: $('mode-saved'),
   sites: $('hidden-sites'),
   noSites: $('no-hidden-sites'),
@@ -19,23 +30,30 @@ const els = {
 };
 
 let hiddenSites = [];
+let existingSheet = null;
 
 // ----- Load ---------------------------------------------------------------
 
 async function init() {
-  let settings = DEFAULT_SETTINGS;
+  let settings = { ...DEFAULT_SETTINGS, ...LEGACY_SETTINGS };
   try {
-    settings = await chrome.storage.sync.get(DEFAULT_SETTINGS);
+    settings = await chrome.storage.sync.get(settings);
   } catch {
     showStatus('error', "Couldn't read your settings. Try reopening this page.");
   }
-  els.url.value = settings.webAppUrl;
-  els.secret.value = settings.secret;
+  if (settings.webAppUrl || settings.secret) {
+    // One-time notice: the old settings are removed right away, so it never shows again.
+    els.legacyNotice.hidden = false;
+    chrome.storage.sync.remove(Object.keys(LEGACY_SETTINGS)).catch(() => {});
+  }
   const mode = document.querySelector(`input[name="buttonMode"][value="${settings.buttonMode}"]`)
     || document.querySelector('input[name="buttonMode"][value="auto"]');
   mode.checked = true;
+  els.autoGhost.checked = settings.autoGhost !== false;
+  els.ghostDays.value = String(settings.ghostAfterDays);
   renderHiddenSites(settings.hiddenSites);
   showShortcut();
+  await refreshConnection();
 }
 
 async function showShortcut() {
@@ -50,63 +68,91 @@ async function showShortcut() {
 
 // ----- Connection ---------------------------------------------------------
 
-/** Returns an error message, or '' when the URL is acceptable (empty clears the setting). */
-function urlProblem(value) {
-  if (!value) return '';
-  if (/\/dev$/.test(value)) return 'That is the /dev test URL. Use the deployed URL that ends in /exec.';
-  if (!WEB_APP_URL_RE.test(value)) return 'Paste the Web App URL from Apps Script. It looks like https://script.google.com/macros/s/…/exec';
-  return '';
+async function refreshConnection() {
+  const res = await ask({ type: 'status' });
+  if (res.ok && res.connected) showConnected(res.sheet);
+  else if (res.ok) showState('disconnected');
+  else failed(res);
 }
 
-function readConnection() {
-  return { webAppUrl: els.url.value.trim(), secret: els.secret.value.trim() };
-}
-
-function checkUrlField(requireValue) {
-  const { webAppUrl } = readConnection();
-  const problem = requireValue && !webAppUrl ? 'Paste your Web App URL first.' : urlProblem(webAppUrl);
-  els.url.setAttribute('aria-invalid', String(Boolean(problem)));
-  if (problem) {
-    showStatus('error', problem);
-    els.url.focus();
-  }
-  return !problem;
-}
-
-async function save(event) {
-  event.preventDefault();
-  if (!checkUrlField(false)) return;
-  try {
-    await chrome.storage.sync.set(readConnection());
-    showStatus('ok', readConnection().webAppUrl ? 'Saved. Use "Test connection" to check it.' : 'Saved. The extension is not connected to a sheet.');
-  } catch {
-    showStatus('error', "Couldn't save your settings. Try again.");
-  }
-}
-
-async function testConnection() {
-  if (!checkUrlField(true)) return;
-  els.test.disabled = true;
-  showStatus('', 'Testing…');
-  let res;
-  try {
-    res = await chrome.runtime.sendMessage({ type: 'ping', ...readConnection() });
-  } catch {
-    res = { ok: false, message: "Couldn't reach the extension's background worker. Reload the extension and try again." };
-  }
-  els.test.disabled = false;
-
-  if (!res || !res.ok) {
-    showStatus('error', (res && res.message) || 'Connection failed.');
+/** Signs in (Google's consent screen on first use), then finds or creates the tracker. */
+async function connect() {
+  setBusy(true);
+  showStatus('', 'Waiting for Google…');
+  const res = await ask({ type: 'connect' });
+  setBusy(false);
+  if (!res.ok) return failed(res);
+  if (res.existing) {
+    existingSheet = res.existing;
+    els.existingName.textContent = res.existing.name;
+    showState('choose');
+    showStatus('', '');
+    els.useExisting.focus();
     return;
   }
-  // A working connection is what the user wants to keep, so save it right away.
-  const saved = await chrome.storage.sync.set(readConnection()).then(() => ' Settings saved.', () => ' Click Save to keep it.');
-  if (!res.setup) {
-    showStatus('warn', `Connected to “${res.sheetName}”, but the sheet isn't set up yet. In the sheet, choose Job Tracker → Run setup.${saved}`);
-  } else {
-    const count = res.rows === 1 ? '1 job saved' : `${res.rows} jobs saved`;
-    showStatus('ok', `✓ Connected to “${res.sheetName}” · ${count}.${saved}`);
+  showConnected(res.sheet, `Created “${res.sheet.name}” in your Google Drive.`);
+}
+
+async function useExisting() {
+  if (!existingSheet) return;
+  await finishConnect({ type: 'use-sheet', id: existingSheet.id }, 'Connected to your existing sheet.');
+}
+
+async function createNew() {
+  await finishConnect({ type: 'create-sheet' }, 'Created a new sheet in your Google Drive.');
+}
+
+async function finishConnect(message, note) {
+  setBusy(true);
+  showStatus('', 'Working…');
+  const res = await ask(message);
+  setBusy(false);
+  if (res.ok) showConnected(res.sheet, note);
+  else failed(res);
+}
+
+async function disconnect() {
+  setBusy(true);
+  const res = await ask({ type: 'disconnect' });
+  setBusy(false);
+  if (!res.ok) return failed(res);
+  showState('disconnected');
+  showStatus('ok', 'Disconnected. Your sheet stays in your Google Drive.');
+  els.connect.focus();
+}
+
+function showConnected(sheet, note = '') {
+  els.sheetName.textContent = sheet.name || 'your sheet';
+  const url = String(sheet.url || '');
+  els.openSheet.href = url.startsWith('https://docs.google.com/') ? url : 'https://docs.google.com/spreadsheets/';
+  showState('connected');
+  showStatus(note ? 'ok' : '', note);
+}
+
+/** Shows the error; when the sheet or sign-in is the problem, the main button offers to reconnect. */
+function failed(res) {
+  const reconnect = RECONNECT_ERRORS.includes(res.error);
+  if (reconnect || els.stateConnected.hidden) showState('disconnected', reconnect);
+  const detail = res.detail && res.error !== 'BAD_REQUEST' ? ` Google said: ${res.detail}` : '';
+  showStatus('error', `${res.message || 'Something went wrong.'}${detail}`);
+}
+
+function showState(name, reconnect = false) {
+  els.stateDisconnected.hidden = name !== 'disconnected';
+  els.stateChoose.hidden = name !== 'choose';
+  els.stateConnected.hidden = name !== 'connected';
+  els.connect.textContent = reconnect ? 'Reconnect' : 'Connect Google Sheets';
+}
+
+function setBusy(on) {
+  for (const button of [els.connect, els.useExisting, els.createNew, els.disconnect]) button.disabled = on;
+}
+
+async function ask(message) {
+  try {
+    return (await chrome.runtime.sendMessage(message)) || { ok: false, message: 'No reply from the extension.' };
+  } catch {
+    return { ok: false, message: "Couldn't reach the extension's background worker. Reload the extension and try again." };
   }
 }
 
@@ -116,20 +162,42 @@ function showStatus(kind, message) {
   els.status.hidden = !message;
 }
 
-// ----- Button mode --------------------------------------------------------
+// ----- Automatic upkeep ---------------------------------------------------
 
-let modeNoteTimer = 0;
+async function saveUpkeep() {
+  const days = Number(els.ghostDays.value);
+  const valid = Number.isInteger(days) && days >= 1 && days <= 365;
+  els.ghostDays.setAttribute('aria-invalid', String(!valid));
+  if (!valid) {
+    flashNote(els.upkeepSaved, 'Enter a whole number of days between 1 and 365.');
+    return;
+  }
+  try {
+    await chrome.storage.sync.set({ autoGhost: els.autoGhost.checked, ghostAfterDays: days });
+    flashNote(els.upkeepSaved, 'Saved');
+  } catch {
+    flashNote(els.upkeepSaved, "Couldn't save. Try again.");
+  }
+}
+
+const noteTimers = new Map();
+
+function flashNote(el, text) {
+  el.textContent = text;
+  clearTimeout(noteTimers.get(el));
+  noteTimers.set(el, setTimeout(() => { el.textContent = ''; }, 2500));
+}
+
+// ----- Button mode --------------------------------------------------------
 
 async function saveMode(event) {
   if (event.target.name !== 'buttonMode') return;
   try {
     await chrome.storage.sync.set({ buttonMode: event.target.value });
-    els.modeSaved.textContent = 'Saved';
+    flashNote(els.modeSaved, 'Saved');
   } catch {
-    els.modeSaved.textContent = "Couldn't save. Try again.";
+    flashNote(els.modeSaved, "Couldn't save. Try again.");
   }
-  clearTimeout(modeNoteTimer);
-  modeNoteTimer = setTimeout(() => { els.modeSaved.textContent = ''; }, 2000);
 }
 
 // ----- Hidden sites -------------------------------------------------------
@@ -164,15 +232,12 @@ async function removeSite(site) {
 
 // ----- Wire up ------------------------------------------------------------
 
-els.form.addEventListener('submit', save);
-els.test.addEventListener('click', testConnection);
-els.url.addEventListener('input', () => els.url.setAttribute('aria-invalid', 'false'));
-els.toggleSecret.addEventListener('click', () => {
-  const show = els.secret.type === 'password';
-  els.secret.type = show ? 'text' : 'password';
-  els.toggleSecret.textContent = show ? 'Hide' : 'Show';
-  els.toggleSecret.setAttribute('aria-pressed', String(show));
-});
+els.connect.addEventListener('click', connect);
+els.useExisting.addEventListener('click', useExisting);
+els.createNew.addEventListener('click', createNew);
+els.disconnect.addEventListener('click', disconnect);
+els.autoGhost.addEventListener('change', saveUpkeep);
+els.ghostDays.addEventListener('change', saveUpkeep);
 document.getElementById('button-mode').addEventListener('change', saveMode);
 els.editShortcut.addEventListener('click', () => {
   chrome.tabs.create({ url: 'chrome://extensions/shortcuts' }).catch(() => {
