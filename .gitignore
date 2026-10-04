@@ -4,8 +4,8 @@ node_modules/
 # Secrets and local config
 .env
 .env.*
+# Extension signing key (see docs/GOOGLE_CLOUD_SETUP.md)
 *.pem
-.clasprc.json
 
 # Build / packaging output
 *.zip
